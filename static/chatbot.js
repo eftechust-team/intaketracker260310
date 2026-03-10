@@ -2,14 +2,16 @@
 
 class NutritionChatbot {
     constructor() {
+        this.currentUserId = null;
+        this.currentUserName = 'Guest';
+        this.allUsers = [];
         this.dailyNutrition = {
             carbs: 0,
             protein: 0,
             fat: 0
         };
         this.userInfo = {};
-        this.profiles = [];
-        this.lastProfileId = null;
+        this.userRecordId = null;
         this.conversationHistory = [];
         this.init();
     }
@@ -23,10 +25,17 @@ class NutritionChatbot {
         this.analyzeBtn = document.getElementById('analyze-btn');
         this.undoBtn = document.getElementById('undo-btn');
         this.clearBtn = document.getElementById('clear-btn');
-        this.profileSelect = document.getElementById('profile-select');
-        this.saveProfileBtn = document.getElementById('save-profile-btn');
-        this.renameProfileBtn = document.getElementById('rename-profile-btn');
-        this.deleteProfileBtn = document.getElementById('delete-profile-btn');
+        this.switchUserBtn = document.getElementById('switch-user-btn');
+        this.currentUserDisplay = document.getElementById('current-user-name');
+        this.calendarBtn = document.getElementById('calendar-btn');
+        this.calendarModal = document.getElementById('calendar-modal');
+        this.closeCalendarModalBtn = document.getElementById('close-calendar-modal');
+        this.userModal = document.getElementById('user-modal');
+        this.closeUserModalBtn = document.getElementById('close-user-modal');
+        this.createUserBtn = document.getElementById('create-user-btn');
+        this.newUserNameInput = document.getElementById('new-user-name');
+        this.userList = document.getElementById('user-list');
+        this.defaultMessagesHtml = this.messagesContainer ? this.messagesContainer.innerHTML : '';
 
         // Counters
         this.carbsDisplay = document.getElementById('carbs-total');
@@ -39,166 +48,123 @@ class NutritionChatbot {
         this.analyzeBtn.addEventListener('click', () => this.handleAnalyze());
         this.undoBtn.addEventListener('click', () => this.undoLast());
         this.clearBtn.addEventListener('click', () => this.clearAll());
-        this.profileSelect.addEventListener('change', () => this.handleProfileSelect());
-        this.saveProfileBtn.addEventListener('click', () => this.handleSaveProfile());
-        this.renameProfileBtn.addEventListener('click', () => this.handleRenameProfile());
-        this.deleteProfileBtn.addEventListener('click', () => this.handleDeleteProfile());
+        this.switchUserBtn.addEventListener('click', () => this.openUserModal());
+        this.closeUserModalBtn.addEventListener('click', () => this.closeUserModal());
+        this.createUserBtn.addEventListener('click', () => this.handleCreateUser());
+        this.calendarBtn.addEventListener('click', () => this.openCalendar());
+        this.closeCalendarModalBtn.addEventListener('click', () => this.closeCalendar());
+        this.calendarModal.addEventListener('click', (e) => {
+            if (e.target === this.calendarModal) this.closeCalendar();
+        });
+        this.userModal.addEventListener('click', (e) => {
+            if (e.target === this.userModal) this.closeUserModal();
+        });
 
-        // Load saved data from localStorage
+        // Load saved data and initialize users
         this.loadSavedData();
+        this.loadAllUsers();
         
         // Update button status based on loaded data
         this.updateAnalyzeButtonStatus();
     }
 
-    loadSavedData() {
-        const savedNutrition = localStorage.getItem('dailyNutrition');
-        const savedUserInfo = localStorage.getItem('userInfo');
-        const savedProfiles = localStorage.getItem('profiles');
-        const savedLastProfileId = localStorage.getItem('lastProfileId');
-
-        if (savedNutrition) {
-            this.dailyNutrition = JSON.parse(savedNutrition);
-            this.updateDisplay();
-        }
-
-        if (savedProfiles) {
-            try {
-                this.profiles = JSON.parse(savedProfiles);
-            } catch (err) {
-                console.error('Failed to parse profiles', err);
-                this.profiles = [];
+    async loadAllUsers() {
+        try {
+            const response = await fetch('/api/user-records');
+            if (response.ok) {
+                const data = await response.json();
+                this.allUsers = data.records || [];
+                console.log('[MultiUser] Loaded users:', this.allUsers);
+                
+                // If no current user, show modal to create one
+                if (!this.currentUserId && this.allUsers.length === 0) {
+                    setTimeout(() => this.openUserModal(), 500);
+                }
             }
+        } catch (err) {
+            console.error('[MultiUser] Failed to load users:', err);
+        }
+    }
+
+    loadSavedData() {
+        const savedUserRecordId = localStorage.getItem('userRecordId');
+        const savedCurrentUserId = localStorage.getItem('currentUserId');
+        const savedCurrentUserName = localStorage.getItem('currentUserName');
+
+        if (savedUserRecordId) {
+            this.userRecordId = savedUserRecordId || null;
         }
 
-        if (savedLastProfileId) {
-            this.lastProfileId = savedLastProfileId || null;
+        if (savedCurrentUserId) {
+            this.currentUserId = savedCurrentUserId;
         }
 
-        // If we have a last profile, load it; otherwise fall back to plain userInfo storage
-        if (this.lastProfileId && this.getProfileById(this.lastProfileId)) {
-            this.loadProfile(this.lastProfileId, { silent: true });
-        } else if (savedUserInfo) {
-            this.userInfo = JSON.parse(savedUserInfo);
-            this.populateUserForm();
+        if (savedCurrentUserName) {
+            this.currentUserName = savedCurrentUserName;
+            this.updateCurrentUserDisplay();
         }
 
-        this.updateProfileSelect();
+        this.loadCurrentUserState();
     }
 
     saveData() {
-        localStorage.setItem('dailyNutrition', JSON.stringify(this.dailyNutrition));
-        localStorage.setItem('userInfo', JSON.stringify(this.userInfo));
-        localStorage.setItem('profiles', JSON.stringify(this.profiles));
-        localStorage.setItem('lastProfileId', this.lastProfileId || '');
+        localStorage.setItem('userRecordId', this.userRecordId || '');
+        localStorage.setItem('currentUserId', this.currentUserId || '');
+        localStorage.setItem('currentUserName', this.currentUserName || 'Guest');
+        this.saveCurrentUserState();
     }
 
-    getProfileById(id) {
-        return this.profiles.find(p => p.id === id);
+    getUserStateKey(userId) {
+        return `userState:${userId || 'guest'}`;
     }
 
-    updateProfileSelect() {
-        if (!this.profileSelect) return;
-        this.profileSelect.innerHTML = '<option value="">Select...</option>';
-        this.profiles.forEach(p => {
-            const opt = document.createElement('option');
-            opt.value = p.id;
-            opt.textContent = p.name;
-            this.profileSelect.appendChild(opt);
-        });
-
-        if (this.lastProfileId) {
-            this.profileSelect.value = this.lastProfileId;
-        }
+    saveCurrentUserState() {
+        // Only save state for real (non-guest) users
+        if (!this.currentUserId) return;
+        const key = this.getUserStateKey(this.currentUserId);
+        const state = {
+            dailyNutrition: this.dailyNutrition,
+            userInfo: this.userInfo,
+            conversationHistory: this.conversationHistory,
+            messagesHtml: this.messagesContainer ? this.messagesContainer.innerHTML : ''
+        };
+        localStorage.setItem(key, JSON.stringify(state));
     }
 
-    handleProfileSelect() {
-        const profileId = this.profileSelect.value;
-        if (!profileId) return;
-        this.loadProfile(profileId);
-    }
+    loadCurrentUserState() {
+        const key = this.getUserStateKey(this.currentUserId);
+        const raw = localStorage.getItem(key);
 
-    handleSaveProfile() {
-        // Ensure we have the latest form values
-        this.updateUserInfo();
+        // Defaults for new users without saved state
+        this.dailyNutrition = { carbs: 0, protein: 0, fat: 0 };
+        this.userInfo = {};
+        this.conversationHistory = [];
 
-        const name = prompt('Save profile as:', 'My profile');
-        if (!name) return;
-
-        // Overwrite if a profile with the same name exists
-        const existing = this.profiles.find(p => p.name.toLowerCase() === name.toLowerCase());
-        if (existing) {
-            existing.data = { ...this.userInfo };
-            this.lastProfileId = existing.id;
-        } else {
-            const newProfile = {
-                id: `profile-${Date.now()}`,
-                name: name.trim(),
-                data: { ...this.userInfo },
-            };
-            this.profiles.push(newProfile);
-            this.lastProfileId = newProfile.id;
+        if (raw) {
+            try {
+                const state = JSON.parse(raw);
+                this.dailyNutrition = state.dailyNutrition || { carbs: 0, protein: 0, fat: 0 };
+                this.userInfo = state.userInfo || {};
+                this.conversationHistory = state.conversationHistory || [];
+                if (this.messagesContainer && state.messagesHtml) {
+                    this.messagesContainer.innerHTML = state.messagesHtml;
+                    this.messagesContainer.scrollTop = this.messagesContainer.scrollHeight;
+                }
+            } catch (err) {
+                console.error('[MultiUser] Failed to parse user state:', err);
+            }
+        } else if (this.messagesContainer) {
+            // New user with no saved state: show default intro, not previous user's messages.
+            this.messagesContainer.innerHTML = this.defaultMessagesHtml || '';
+            this.messagesContainer.scrollTop = this.messagesContainer.scrollHeight;
         }
 
-        this.updateProfileSelect();
-        this.saveData();
-        this.addMessage(`💾 Saved profile "${name}".`, 'bot');
-    }
-
-    handleRenameProfile() {
-        const profileId = this.profileSelect.value;
-        if (!profileId) {
-            this.addMessage('⚠️ Select a profile to rename.', 'bot');
-            return;
-        }
-
-        const profile = this.getProfileById(profileId);
-        if (!profile) return;
-
-        const newName = prompt('Rename profile to:', profile.name);
-        if (!newName) return;
-
-        profile.name = newName.trim();
-        this.updateProfileSelect();
-        this.saveData();
-        this.addMessage(`✏️ Renamed profile to "${newName}".`, 'bot');
-    }
-
-    handleDeleteProfile() {
-        const profileId = this.profileSelect.value;
-        if (!profileId) {
-            this.addMessage('⚠️ Select a profile to delete.', 'bot');
-            return;
-        }
-
-        const profile = this.getProfileById(profileId);
-        if (!profile) return;
-
-        const ok = confirm(`Delete profile "${profile.name}"?`);
-        if (!ok) return;
-
-        this.profiles = this.profiles.filter(p => p.id !== profileId);
-        if (this.lastProfileId === profileId) {
-            this.lastProfileId = null;
-        }
-        this.profileSelect.value = '';
-        this.updateProfileSelect();
-        this.saveData();
-        this.addMessage(`🗑️ Deleted profile "${profile.name}".`, 'bot');
-    }
-
-    loadProfile(profileId, { silent = false } = {}) {
-        const profile = this.getProfileById(profileId);
-        if (!profile) return;
-        this.userInfo = { ...profile.data };
+        this.updateDisplay();
         this.populateUserForm();
-        this.lastProfileId = profileId;
-        this.saveData();
         this.updateAnalyzeButtonStatus();
-        if (!silent) {
-            this.addMessage(`📥 Loaded profile "${profile.name}".`, 'bot');
-        }
     }
+
+
 
     updateUserInfo() {
         const formData = new FormData(this.userInfoForm);
@@ -213,9 +179,33 @@ class NutritionChatbot {
         };
         this.saveData();
         this.updateAnalyzeButtonStatus();
+        
+        // Auto-save to backend if user is logged in
+        if (this.currentUserId) {
+            this.saveUserInfoToBackend();
+        }
+    }
+
+    async saveUserInfoToBackend() {
+        if (!this.currentUserId) return;
+        
+        try {
+            await fetch('/api/user-records', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    user_id: this.currentUserId,
+                    user_info: { ...this.userInfo, name: this.currentUserName }
+                })
+            });
+            console.log('[UserInfo] Auto-saved user info to backend');
+        } catch (err) {
+            console.error('[UserInfo] Failed to save user info:', err);
+        }
     }
 
     populateUserForm() {
+        this.clearUserForm();
         if (this.userInfo.gender) {
             document.querySelector(`input[name="gender"][value="${this.userInfo.gender}"]`).checked = true;
         }
@@ -226,6 +216,347 @@ class NutritionChatbot {
         if (this.userInfo.diet) document.querySelector('select[name="diet"]').value = this.userInfo.diet;
         if (this.userInfo.preference) {
             document.querySelector(`input[name="preference"][value="${this.userInfo.preference}"]`).checked = true;
+        }
+    }
+
+    clearUserForm() {
+        this.userInfoForm.reset();
+    }
+
+    updateCurrentUserDisplay() {
+        if (this.currentUserDisplay) {
+            this.currentUserDisplay.textContent = this.currentUserName || 'Guest';
+        }
+    }
+
+    openUserModal() {
+        this.userModal.style.display = 'flex';
+        this.renderUserList();
+    }
+
+    closeUserModal() {
+        this.userModal.style.display = 'none';
+    }
+
+    renderUserList() {
+        this.userList.innerHTML = '';
+        
+        if (this.allUsers.length === 0) {
+            this.userList.innerHTML = '<div class="no-users-message">No users yet. Create one to get started.</div>';
+            return;
+        }
+
+        this.allUsers.forEach(user => {
+            const userItem = document.createElement('div');
+            userItem.className = 'user-item';
+            if (user.id === this.currentUserId) {
+                userItem.classList.add('active');
+            }
+
+            const userNameSpan = document.createElement('span');
+            userNameSpan.className = 'user-name';
+            userNameSpan.textContent = user.user_info?.name || user.id;
+            userNameSpan.dataset.userId = user.id;
+
+            const switchBtn = document.createElement('button');
+            switchBtn.className = 'switch-user-btn';
+            switchBtn.textContent = this.currentUserId === user.id ? '✓ Current' : 'Switch';
+            switchBtn.addEventListener('click', () => this.switchToUser(user));
+
+            const editBtn = document.createElement('button');
+            editBtn.className = 'edit-user-btn';
+            editBtn.textContent = 'Edit';
+            editBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                this.startInlineUserNameEdit(user.id, userNameSpan, userItem);
+            });
+
+            const deleteBtn = document.createElement('button');
+            deleteBtn.className = 'delete-user-btn';
+            deleteBtn.textContent = '✕';
+            deleteBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                this.deleteUser(user.id);
+            });
+
+            userItem.appendChild(userNameSpan);
+            userItem.appendChild(switchBtn);
+            userItem.appendChild(editBtn);
+            userItem.appendChild(deleteBtn);
+            this.userList.appendChild(userItem);
+        });
+    }
+
+    startInlineUserNameEdit(userId, userNameSpan, userItem) {
+        const user = this.allUsers.find(u => u.id === userId);
+        if (!user || !userNameSpan || !userItem) return;
+
+        // Prevent duplicate inline editors in same row
+        if (userItem.querySelector('.inline-rename-wrapper')) {
+            return;
+        }
+
+        const currentName = user.user_info?.name || userId;
+        const switchBtn = userItem.querySelector('.switch-user-btn');
+        if (switchBtn) {
+            switchBtn.style.display = 'none';
+        }
+
+        const wrapper = document.createElement('div');
+        wrapper.className = 'inline-rename-wrapper';
+
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'inline-rename-input';
+        input.value = currentName;
+
+        const saveBtn = document.createElement('button');
+        saveBtn.type = 'button';
+        saveBtn.className = 'inline-rename-save';
+        saveBtn.textContent = 'Save';
+
+        const cancelBtn = document.createElement('button');
+        cancelBtn.type = 'button';
+        cancelBtn.className = 'inline-rename-cancel';
+        cancelBtn.textContent = 'Cancel';
+
+        wrapper.appendChild(input);
+        wrapper.appendChild(saveBtn);
+        wrapper.appendChild(cancelBtn);
+
+        userItem.replaceChild(wrapper, userNameSpan);
+        input.focus();
+        input.select();
+
+        const cancelEdit = () => {
+            const restoredName = document.createElement('span');
+            restoredName.className = 'user-name';
+            restoredName.dataset.userId = userId;
+            restoredName.textContent = user.user_info?.name || userId;
+            if (wrapper.parentNode === userItem) {
+                userItem.replaceChild(restoredName, wrapper);
+            }
+            if (switchBtn) {
+                switchBtn.style.display = '';
+            }
+        };
+
+        saveBtn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            await this.editUserName(userId, input.value.trim());
+        });
+
+        cancelBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            cancelEdit();
+        });
+
+        input.addEventListener('keydown', async (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                await this.editUserName(userId, input.value.trim());
+            }
+            if (e.key === 'Escape') {
+                e.preventDefault();
+                cancelEdit();
+            }
+        });
+    }
+
+    async editUserName(userId, newName) {
+        const user = this.allUsers.find(u => u.id === userId);
+        if (!user) return;
+
+        const trimmedName = (newName || '').trim();
+        if (!trimmedName) return;
+
+        try {
+            const updatedUserInfo = { ...(user.user_info || {}), name: trimmedName };
+            const response = await fetch('/api/user-records', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    user_id: userId,
+                    user_info: updatedUserInfo
+                })
+            });
+
+            if (!response.ok) {
+                alert('Failed to update user name. Please try again.');
+                return;
+            }
+
+            user.user_info = updatedUserInfo;
+
+            if (this.currentUserId === userId) {
+                this.currentUserName = trimmedName;
+                this.updateCurrentUserDisplay();
+                this.saveData();
+            }
+
+            this.renderUserList();
+            this.addMessage(`✏️ User renamed to "${trimmedName}".`, 'bot');
+        } catch (err) {
+            console.error('[MultiUser] Failed to edit user name:', err);
+            alert('Error updating user name.');
+        }
+    }
+
+    async switchToUser(user) {
+        console.log('[MultiUser] Switching to user:', user);
+
+        // Save current user's daily intake if we have a current user
+        if (this.currentUserId && this.userRecordId) {
+            try {
+                await this.saveDailyIntakeToBackend();
+            } catch (err) {
+                console.error('[MultiUser] Failed to save current user intake:', err);
+            }
+        }
+
+        // Persist current user's local state before switching
+        this.saveCurrentUserState();
+
+        // Switch to new user
+        this.currentUserId = user.id;
+        this.currentUserName = user.user_info?.name || user.id;
+        this.userRecordId = user.id;
+
+        // Load selected user's local state (chat, intake, profile)
+        this.loadCurrentUserState();
+
+        // If no local profile exists yet, initialize from backend profile
+        const hasLocalProfile = this.userInfo && Object.keys(this.userInfo).length > 0;
+        if (!hasLocalProfile && user.user_info) {
+            this.userInfo = { ...user.user_info };
+            this.populateUserForm();
+            this.saveCurrentUserState();
+        }
+
+        // Save to localStorage
+        this.saveData();
+        this.updateCurrentUserDisplay();
+        this.renderUserList();
+        this.closeUserModal();
+
+        this.addMessage(`👤 Switched to ${this.currentUserName}'s account.`, 'bot');
+    }
+
+    async handleCreateUser() {
+        const userName = this.newUserNameInput.value.trim();
+        if (!userName) {
+            alert('Please enter a name for the new user.');
+            return;
+        }
+
+        try {
+            const response = await fetch('/api/user-records', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: userName })
+            });
+
+            if (!response.ok) {
+                alert('Failed to create user. Please try again.');
+                return;
+            }
+
+            const data = await response.json();
+            console.log('[MultiUser] Created new user:', data);
+
+            // Add to local users list
+            this.allUsers.push(data.user);
+
+            // Reload the user list
+            this.renderUserList();
+
+            // Clear input
+            this.newUserNameInput.value = '';
+
+            this.addMessage(`✅ Created new user "${userName}".`, 'bot');
+        } catch (err) {
+            console.error('[MultiUser] Failed to create user:', err);
+            alert('Error creating user:', err.message);
+        }
+    }
+
+    async deleteUser(userId) {
+        const user = this.allUsers.find(u => u.id === userId);
+        if (!user) return;
+
+        const ok = confirm(`Delete user "${user.user_info?.name || userId}"?`);
+        if (!ok) return;
+
+        try {
+            const response = await fetch(`/api/user-records/${userId}`, {
+                method: 'DELETE'
+            });
+
+            if (!response.ok) {
+                alert('Failed to delete user.');
+                return;
+            }
+
+            // Remove from local list
+            this.allUsers = this.allUsers.filter(u => u.id !== userId);
+
+            // If deleted user was current, reset to first user or guest
+            if (this.currentUserId === userId) {
+                if (this.allUsers.length > 0) {
+                    await this.switchToUser(this.allUsers[0]);
+                } else {
+                    this.currentUserId = null;
+                    this.currentUserName = 'Guest';
+                    this.userRecordId = null;
+                    this.dailyNutrition = { carbs: 0, protein: 0, fat: 0 };
+                    this.updateDisplay();
+                    this.saveData();
+                    this.updateCurrentUserDisplay();
+                }
+            }
+
+            this.renderUserList();
+            this.addMessage(`🗑️ Deleted user.`, 'bot');
+        } catch (err) {
+            console.error('[MultiUser] Failed to delete user:', err);
+            alert('Error deleting user:', err.message);
+        }
+    }
+
+    async saveDailyIntakeToBackend() {
+        if (!this.currentUserId) return;
+
+        try {
+            // Attach recommended values if the user has run a recommendation this session
+            let recommended = {};
+            const lastRec = sessionStorage.getItem('lastRecommendation');
+            if (lastRec) {
+                try {
+                    const rec = JSON.parse(lastRec);
+                    recommended = {
+                        calories: rec.calories,
+                        carbs: rec.carbohydrate_intake,
+                        protein: rec.protein_intake,
+                        fat: rec.fat_intake
+                    };
+                } catch (_) {}
+            }
+
+            const response = await fetch(`/api/daily-intake/${this.currentUserId}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    daily_nutrition: this.dailyNutrition,
+                    recommended,
+                    timestamp: new Date().toISOString()
+                })
+            });
+
+            if (response.ok) {
+                console.log('[MultiUser] Saved daily intake for user:', this.currentUserId);
+            }
+        } catch (err) {
+            console.error('[MultiUser] Failed to save daily intake:', err);
         }
     }
 
@@ -297,7 +628,7 @@ Your daily totals have been updated. Keep tracking!`;
         }
 
         // Show loading state
-        const loadingMsg = this.addMessage('🔍 Searching USDA database...', 'bot', true);
+        const loadingMsg = this.addMessage('🔍 Searching CSV nutrition database...', 'bot', true);
 
         try {
             // Call the API
@@ -323,23 +654,25 @@ Your daily totals have been updated. Keep tracking!`;
 
             // Extract nutrition data
             const nutrition = result.nutrition;
+            const individualFoods = result.individual_foods || [];
             
-            // Check if nutrition data is actually valid (not all zeros)
-            if (nutrition.carbs === 0 && nutrition.protein === 0 && nutrition.fat === 0) {
-                this.updateMessage(loadingMsg, `⚠️ Found "${nutrition.food_name}" but nutrition data appears incomplete.\n\nThis might be a data limitation with the USDA database for this item. Try a different food or variation.`);
+            // Check if nutrition data is actually valid (not all zeros across macros and calories)
+            if ((nutrition.carbs || 0) === 0 && (nutrition.protein || 0) === 0 && (nutrition.fat || 0) === 0 && (nutrition.calories || 0) === 0) {
+                this.updateMessage(loadingMsg, `⚠️ Found foods but nutrition data appears incomplete.\n\nThis might be a data limitation. Try a different food or variation.`);
                 return;
             }
             
             this.addFoodToDaily(nutrition);
 
-            // Generate friendly response
-            const responseMsg = this.generateFoodResponse(nutrition);
+            // Generate friendly response showing all foods if multiple
+            const responseMsg = this.generateFoodResponse(nutrition, individualFoods);
             this.updateMessage(loadingMsg, responseMsg);
 
             // Add to conversation history
             this.conversationHistory.push({
                 input: foodInput,
                 nutrition: nutrition,
+                individualFoods: individualFoods,
                 timestamp: new Date()
             });
 
@@ -354,12 +687,32 @@ Your daily totals have been updated. Keep tracking!`;
         }
     }
 
-    generateFoodResponse(nutrition) {
-        return `
-✅ <strong>${nutrition.food_name}</strong>
+    generateFoodResponse(nutrition, individualFoods = []) {
+        let foodsDisplay = '';
+        
+        // Show individual foods if multiple
+        if (individualFoods.length > 1) {
+            foodsDisplay = '<div class="foods-list">';
+            individualFoods.forEach(food => {
+                foodsDisplay += `
+                <div class="food-item-display" style="margin-bottom: 12px;">
+                    <div class="food-name">${food.quantity}${food.unit} ${food.food_name}</div>
+                    <div class="nutrition-row" style="font-size: 12px; color: #666;">
+                        <span>Carbs: ${food.carbs}g</span> | 
+                        <span>Protein: ${food.protein}g</span> | 
+                        <span>Fat: ${food.fat}g</span>
+                    </div>
+                </div>`;
+            });
+            foodsDisplay += '</div>';
+            
+            return `
+✅ <strong>Added ${individualFoods.length} foods</strong>
 
-<div class="food-item-display">
-    <div class="food-name">${nutrition.quantity}${nutrition.unit} added</div>
+${foodsDisplay}
+
+<div style="margin-top: 12px; padding-top: 12px; border-top: 1px solid #eee;">
+    <strong>Total Added:</strong>
     <div class="nutrition-row">
         <span>Carbs:</span>
         <span>${nutrition.carbs}g</span>
@@ -375,7 +728,53 @@ Your daily totals have been updated. Keep tracking!`;
 </div>
 
 Your daily totals have been updated. Keep tracking!
-        `;
+            `;
+        } else if (individualFoods.length === 1) {
+            const food = individualFoods[0];
+            return `
+✅ <strong>${food.food_name}</strong>
+
+<div class="food-item-display">
+    <div class="food-name">${food.quantity}${food.unit} added</div>
+    <div class="nutrition-row">
+        <span>Carbs:</span>
+        <span>${food.carbs}g</span>
+    </div>
+    <div class="nutrition-row">
+        <span>Protein:</span>
+        <span>${food.protein}g</span>
+    </div>
+    <div class="nutrition-row">
+        <span>Fat:</span>
+        <span>${food.fat}g</span>
+    </div>
+</div>
+
+Your daily totals have been updated. Keep tracking!
+            `;
+        } else {
+            // Fallback to old format if no individual foods
+            return `
+✅ <strong>Food Added</strong>
+
+<div class="food-item-display">
+    <div class="nutrition-row">
+        <span>Carbs:</span>
+        <span>${nutrition.carbs}g</span>
+    </div>
+    <div class="nutrition-row">
+        <span>Protein:</span>
+        <span>${nutrition.protein}g</span>
+    </div>
+    <div class="nutrition-row">
+        <span>Fat:</span>
+        <span>${nutrition.fat}g</span>
+    </div>
+</div>
+
+Your daily totals have been updated. Keep tracking!
+            `;
+        }
     }
 
     addFoodToDaily(nutrition) {
@@ -418,6 +817,11 @@ Your daily totals have been updated. Keep tracking!
         // Scroll to bottom
         this.messagesContainer.scrollTop = this.messagesContainer.scrollHeight;
 
+        // Persist message history only for identified users
+        if (this.currentUserId) {
+            this.saveCurrentUserState();
+        }
+
         return messageDiv;
     }
 
@@ -425,6 +829,9 @@ Your daily totals have been updated. Keep tracking!
         const contentDiv = messageElement.querySelector('.message-content');
         contentDiv.innerHTML = newText;
         messageElement.classList.remove('loading');
+        if (this.currentUserId) {
+            this.saveCurrentUserState();
+        }
     }
 
     async handleAnalyze() {
@@ -459,6 +866,7 @@ Your daily totals have been updated. Keep tracking!
                     'Content-Type': 'application/json'
                 },
                 body: JSON.stringify({
+                    user_id: this.userRecordId,
                     user_info: this.userInfo,
                     daily_nutrition: this.dailyNutrition
                 })
@@ -483,6 +891,10 @@ Your daily totals have been updated. Keep tracking!
             }
 
             const rec = result.recommendation;
+            if (result.user_id) {
+                this.userRecordId = result.user_id;
+                this.saveData();
+            }
             const responseMsg = this.generateRecommendationResponse(rec);
             this.updateMessage(loadingMsg, responseMsg);
 
@@ -671,6 +1083,191 @@ Your daily totals have been updated. Keep tracking!
         this.updateDisplay();
         this.saveData();
         this.addMessage('✨ Daily tracker has been reset. Start tracking your meals!', 'bot');
+    }
+
+    // ─── Calendar ─────────────────────────────────────────────────────────────
+
+    async openCalendar() {
+        if (!this.currentUserId) {
+            alert('Please select a user account first.');
+            return;
+        }
+        // Persist today's intake before showing history
+        await this.saveDailyIntakeToBackend();
+
+        try {
+            const res = await fetch(`/api/daily-intake/${this.currentUserId}`);
+            if (!res.ok) throw new Error('Failed to load history');
+            const data = await res.json();
+            this.calendarHistory = data.history || [];
+        } catch (err) {
+            console.error('[Calendar] Failed to load history:', err);
+            this.calendarHistory = [];
+        }
+
+        const now = new Date();
+        this.calendarYear = now.getFullYear();
+        this.calendarMonth = now.getMonth(); // 0-indexed
+
+        this.calendarModal.style.display = 'flex';
+        this.renderCalendar();
+    }
+
+    closeCalendar() {
+        this.calendarModal.style.display = 'none';
+        const detail = document.getElementById('cal-day-detail');
+        if (detail) detail.style.display = 'none';
+    }
+
+    renderCalendar() {
+        const label = document.getElementById('cal-month-label');
+        const grid = document.getElementById('cal-grid');
+        const calView = document.getElementById('cal-calendar-view');
+        const detail = document.getElementById('cal-day-detail');
+        if (!grid) return;
+
+        // Show calendar grid, hide detail
+        if (calView) calView.style.display = '';
+        if (detail) detail.style.display = 'none';
+        detail.innerHTML = '';
+
+        const monthNames = ['January','February','March','April','May','June',
+                            'July','August','September','October','November','December'];
+        label.textContent = `${monthNames[this.calendarMonth]} ${this.calendarYear}`;
+
+        // Build lookup map: date-string → history entry
+        const histMap = {};
+        (this.calendarHistory || []).forEach(e => { histMap[e.date] = e; });
+
+        // First weekday of month (0=Sun)
+        const firstDay = new Date(this.calendarYear, this.calendarMonth, 1).getDay();
+        const daysInMonth = new Date(this.calendarYear, this.calendarMonth + 1, 0).getDate();
+        const todayStr = new Date().toISOString().slice(0, 10);
+
+        grid.innerHTML = '';
+
+        // Leading empty cells
+        for (let i = 0; i < firstDay; i++) {
+            const blank = document.createElement('div');
+            blank.className = 'cal-cell cal-cell-empty';
+            grid.appendChild(blank);
+        }
+
+        for (let d = 1; d <= daysInMonth; d++) {
+            const dateStr = `${this.calendarYear}-${String(this.calendarMonth + 1).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+            const entry = histMap[dateStr];
+            const cell = document.createElement('div');
+            cell.className = 'cal-cell';
+
+            if (dateStr === todayStr) cell.classList.add('cal-cell-today');
+
+            const dayNum = document.createElement('div');
+            dayNum.className = 'cal-cell-day';
+            dayNum.textContent = d;
+            cell.appendChild(dayNum);
+
+            if (entry) {
+                const n = entry.nutrition || {};
+                const kcal = Math.round((n.carbs || 0) * 4 + (n.protein || 0) * 4 + (n.fat || 0) * 9);
+                const kcalDiv = document.createElement('div');
+                kcalDiv.className = 'cal-cell-kcal';
+                kcalDiv.textContent = `${kcal} kcal`;
+                cell.appendChild(kcalDiv);
+
+                // Colour cell based on fill vs recommended
+                let pct = null;
+                if (entry.recommended && entry.recommended.calories) {
+                    pct = kcal / entry.recommended.calories;
+                }
+                if (pct === null) {
+                    cell.classList.add('cal-cell-has-data');
+                } else if (pct >= 0.9) {
+                    cell.classList.add('cal-cell-good');
+                } else if (pct >= 0.6) {
+                    cell.classList.add('cal-cell-fair');
+                } else {
+                    cell.classList.add('cal-cell-low');
+                }
+
+                cell.style.cursor = 'pointer';
+                cell.addEventListener('click', () => this.showDayDetail(dateStr, entry));
+            }
+
+            grid.appendChild(cell);
+        }
+
+        // Wire prev/next buttons (re-attach cleanly)
+        const prevBtn = document.getElementById('cal-prev');
+        const nextBtn = document.getElementById('cal-next');
+        prevBtn.onclick = () => {
+            this.calendarMonth--;
+            if (this.calendarMonth < 0) { this.calendarMonth = 11; this.calendarYear--; }
+            this.renderCalendar();
+        };
+        nextBtn.onclick = () => {
+            this.calendarMonth++;
+            if (this.calendarMonth > 11) { this.calendarMonth = 0; this.calendarYear++; }
+            this.renderCalendar();
+        };
+    }
+
+    showDayDetail(dateStr, entry) {
+        const detail = document.getElementById('cal-day-detail');
+        const calView = document.getElementById('cal-calendar-view');
+        if (!detail) return;
+
+        const n = entry.nutrition || {};
+        const r = entry.recommended || {};
+
+        const actualKcal = Math.round((n.carbs || 0) * 4 + (n.protein || 0) * 4 + (n.fat || 0) * 9);
+        const recKcal = r.calories || null;
+
+        const fmt = (v) => Number(v || 0).toFixed(1);
+        const pctBar = (actual, target) => {
+            if (!target) return '';
+            const pct = Math.min(100, Math.round((actual / target) * 100));
+            const color = pct >= 90 ? '#22c55e' : pct >= 60 ? '#f59e0b' : '#ef4444';
+            return `<div class="cal-bar-wrap"><div class="cal-bar-fill" style="width:${pct}%;background:${color};"></div></div>`;
+        };
+
+        const row = (icon, lbl, actual, target, unit) => `
+            <div class="cal-detail-row">
+                <span class="cal-detail-label">${icon} ${lbl}</span>
+                <span class="cal-detail-values">${fmt(actual)}${unit}${target ? ` / ${fmt(target)}${unit}` : ''}</span>
+            </div>
+            ${pctBar(actual, target)}`;
+
+        const [y, m, d] = dateStr.split('-');
+        const monthNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+        const displayDate = `${monthNames[parseInt(m)-1]} ${parseInt(d)}, ${y}`;
+
+        detail.innerHTML = `
+            <div class="cal-detail-header">
+                <button type="button" class="cal-back-btn" onclick="window.chatbot.backToCalendar()">&#8592; Back</button>
+                <strong>${displayDate}</strong>
+            </div>
+            <div class="cal-detail-body">
+                <div class="cal-detail-row" style="margin-bottom:6px;">
+                    <span class="cal-detail-label">&#128293; Calories</span>
+                    <span class="cal-detail-values" style="font-weight:700;font-size:15px;">${actualKcal} kcal${recKcal ? ` / ${Math.round(recKcal)} kcal` : ''}</span>
+                </div>
+                ${recKcal ? pctBar(actualKcal, recKcal) : ''}
+                <div class="cal-detail-divider"></div>
+                ${row('&#127828;', 'Carbs',   n.carbs   || 0, r.carbs   || null, 'g')}
+                ${row('&#127831;', 'Protein', n.protein || 0, r.protein || null, 'g')}
+                ${row('&#129361;', 'Fat',     n.fat     || 0, r.fat     || null, 'g')}
+            </div>`;
+
+        // Swap views
+        if (calView) calView.style.display = 'none';
+        detail.style.display = 'block';
+    }
+
+    backToCalendar() {
+        const detail = document.getElementById('cal-day-detail');
+        const calView = document.getElementById('cal-calendar-view');
+        if (detail) detail.style.display = 'none';
+        if (calView) calView.style.display = '';
     }
 }
 

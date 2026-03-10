@@ -17,7 +17,68 @@
         <div class="brand">
             <img src="/static/elevatefoods-logo.jpeg" alt="ELEVATEFOODS" class="brand-logo">
         </div>
+        <div class="user-account-section">
+            <div class="current-user-display">
+                <span class="user-label">User:</span>
+                <span class="user-name" id="current-user-name">Guest</span>
+            </div>
+            <div class="user-controls">
+                <button type="button" id="switch-user-btn" class="btn-secondary" title="Switch or create user account">Switch User</button>
+                <button type="button" id="calendar-btn" class="btn-secondary" title="View nutrition calendar">📅 Calendar</button>
+            </div>
+        </div>
     </header>
+
+    <!-- Calendar Modal -->
+    <div id="calendar-modal" class="modal" style="display: none;">
+        <div class="modal-content cal-modal-content">
+            <div class="modal-header">
+                <h2>Nutrition Calendar</h2>
+                <button type="button" class="modal-close" id="close-calendar-modal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div id="cal-calendar-view">
+                    <div class="cal-nav">
+                        <button type="button" id="cal-prev" class="cal-nav-btn">&#8249;</button>
+                        <span id="cal-month-label" class="cal-month-label"></span>
+                        <button type="button" id="cal-next" class="cal-nav-btn">&#8250;</button>
+                    </div>
+                    <div class="cal-dow-header">
+                        <span>Sun</span><span>Mon</span><span>Tue</span>
+                        <span>Wed</span><span>Thu</span><span>Fri</span><span>Sat</span>
+                    </div>
+                    <div class="cal-grid" id="cal-grid"></div>
+                </div>
+                <div id="cal-day-detail" class="cal-day-detail" style="display:none;"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- User Account Modal -->
+    <div id="user-modal" class="modal" style="display: none;">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>User Accounts</h2>
+                <button type="button" class="modal-close" id="close-user-modal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="modal-section">
+                    <h3>Existing Users</h3>
+                    <div id="user-list" class="user-list">
+                        <!-- Populated by JS -->
+                    </div>
+                </div>
+                <div class="modal-section">
+                    <h3>Create New User</h3>
+                    <div class="form-field">
+                        <label>User Name</label>
+                        <input type="text" id="new-user-name" placeholder="e.g., Mom, Dad, Child">
+                    </div>
+                    <button type="button" id="create-user-btn" class="btn-primary">Create User</button>
+                </div>
+            </div>
+        </div>
+    </div>
 
     <main>
         <div class="chatbot-container">
@@ -46,21 +107,11 @@
                         <button id="undo-btn" class="btn-secondary" style="flex: 1; padding: 8px; font-size: 12px;" title="Undo last food entry">↶ Undo</button>
                         <button id="clear-btn" class="btn-secondary" style="flex: 1; padding: 8px; font-size: 12px;" title="Clear all food entries">✕ Clear All</button>
                     </div>
+                    <button id="analyze-btn" class="btn-primary" style="width: 100%; margin-top: 12px;">Get Recommendations</button>
                 </div>
 
                 <div class="sidebar-panel">
                     <h3>Your Info</h3>
-                    <div class="profile-controls">
-                        <label class="profile-label">Saved Profiles</label>
-                        <div class="profile-row">
-                            <select id="profile-select">
-                                <option value="">Select...</option>
-                            </select>
-                            <button type="button" id="rename-profile-btn" class="btn-secondary profile-btn" title="Rename selected profile">Rename</button>
-                            <button type="button" id="delete-profile-btn" class="btn-secondary profile-btn" title="Delete selected profile">Delete</button>
-                        </div>
-                        <button type="button" id="save-profile-btn" class="btn-secondary" title="Save current answers as a profile">Save Profile</button>
-                    </div>
                     <form id="user-info-form" class="user-info-form">
                         <div class="form-field">
                             <label>Gender</label>
@@ -111,7 +162,6 @@
                     </form>
                 </div>
 
-                <button id="analyze-btn" class="btn-primary" style="width: 100%; margin-top: 20px;">Get Recommendations</button>
             </aside>
 
             <!-- Main chat area -->
@@ -149,7 +199,7 @@
         </div>
     </main>
 
-    <script src="/static/chatbot.js"></script>
+    <script src="{{ url_for('static', filename='chatbot.js', v='20260305b') }}"></script>
 </body>
 
 </html>

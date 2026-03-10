@@ -9,7 +9,11 @@ import json
 import io
 import requests
 import re
-from datagov_api import get_datagov_client
+import csv
+import tempfile
+import uuid
+from datetime import datetime
+import json as json_lib
 
 # export GOOGLE_APPLICATION_CREDENTIALS="food-ai-455507-e2a9c115814e.json"     
 json_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "food-ai-455507-e2a9c115814e.json"))
@@ -30,6 +34,63 @@ except Exception:
 
 # Mesh storage backend: 'gcs' (default) to upload to Google Cloud Storage, or 'local' to keep files in /tmp and serve directly
 MESH_STORAGE = os.getenv("MESH_STORAGE", "gcs").strip().lower()
+
+def _user_records_path():
+    return os.path.join(tempfile.gettempdir(), "user_records.json")
+
+def _load_user_records():
+    try:
+        path = _user_records_path()
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+    except Exception as e:
+        print(f"[WARN] Failed to load user records: {e}")
+    return {}
+
+def _save_user_records(records):
+    try:
+        path = _user_records_path()
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(records, f)
+    except Exception as e:
+        print(f"[WARN] Failed to save user records: {e}")
+
+def save_user_record(user_id, user_info, daily_nutrition=None, recommendation=None):
+    """Upsert one user record and append an optional recommendation history item."""
+    records = _load_user_records()
+    now = datetime.utcnow().isoformat() + "Z"
+
+    if not user_id:
+        user_id = str(uuid.uuid4())
+
+    existing = records.get(user_id, {
+        'user_id': user_id,
+        'created_at': now,
+        'updated_at': now,
+        'user_info': {},
+        'history': []
+    })
+
+    existing['updated_at'] = now
+    existing['user_info'] = user_info or existing.get('user_info', {})
+
+    if daily_nutrition is not None or recommendation is not None:
+        existing.setdefault('history', []).append({
+            'timestamp': now,
+            'daily_nutrition': daily_nutrition or {},
+            'recommendation': recommendation or {}
+        })
+
+    records[user_id] = existing
+    _save_user_records(records)
+    return existing
+
+def get_user_record(user_id):
+    records = _load_user_records()
+    return records.get(user_id)
 
 def _manifest_path():
     import tempfile
@@ -74,13 +135,34 @@ def upload_to_gcs(bucket_name, source_file_name, destination_blob_name):
 
     # print(f"File {source_file_name} uploaded to {destination_blob_name}.")
 
-# USDA FoodData Central API functions using data.gov API client
-# API key is now securely stored in environment variable: DATA_GOV_API_KEY
-# Get your API key from: https://api.data.gov/
-data_gov_client = get_datagov_client()  # Uses X-Api-Key header authentication
-USDA_API_URL = "https://api.nal.usda.gov/fdc/v1"
+# Load nutrition data from CSV file instead of USDA API
+# CSV columns: category_id, category_name, Density (g/ml), Calories (kcal/g), 
+#              Protein (g/g), Carbohydrates (g/g), Fat (g/g), Reference (FDC ID)
+csv_data = []
+csv_loaded = False
 
-# Simple cache to reduce API calls and avoid rate limits
+def load_nutrition_csv():
+    """Load the nutrition data from CSV file into memory"""
+    global csv_data, csv_loaded
+    try:
+        csv_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "FoodSAM", "food_full_data_revised.csv"))
+        if os.path.exists(csv_path):
+            csv_data = []
+            with open(csv_path, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    csv_data.append(row)
+            csv_loaded = True
+            print(f"Loaded nutrition data from CSV: {len(csv_data)} food items")
+            return True
+        else:
+            print(f"CSV file not found at {csv_path}")
+            return False
+    except Exception as e:
+        print(f"Error loading CSV: {e}")
+        return False
+
+# Simple cache to reduce repeated lookups
 _search_cache = {}
 _nutrition_cache = {}
 
@@ -101,6 +183,48 @@ WORD_NUMBER_MAP = {
     'dozen': 12,
 }
 
+
+def normalize_food_name(name):
+    """Normalize food names for better CSV matching (e.g., apples -> apple)."""
+    cleaned = (name or '').strip().lower()
+    cleaned = re.sub(r'\s+', ' ', cleaned)
+    if cleaned.endswith('es') and len(cleaned) > 3:
+        cleaned = cleaned[:-2]
+    elif cleaned.endswith('s') and len(cleaned) > 2:
+        cleaned = cleaned[:-1]
+    return cleaned
+
+
+def parse_direct_macro_input(text):
+    """Parse direct macro entry like '100g carb' or '+30 protein'."""
+    match = re.match(r'^([+-]?\d+(?:\.\d+)?)\s*g?\s*(carb|carbon|carbohydrate|protein|fat)s?$', text.strip(), re.IGNORECASE)
+    if not match:
+        return None
+
+    amount = float(match.group(1))
+    macro_type = match.group(2).lower()
+
+    nutrition = {'carbs': 0.0, 'protein': 0.0, 'fat': 0.0, 'calories': 0.0}
+    if macro_type in ['carb', 'carbon', 'carbohydrate']:
+        nutrition['carbs'] = amount
+        macro_label = 'carbs'
+    elif macro_type == 'protein':
+        nutrition['protein'] = amount
+        macro_label = 'protein'
+    else:
+        nutrition['fat'] = amount
+        macro_label = 'fat'
+
+    return {
+        'food_name': f"direct {macro_label}",
+        'quantity': amount,
+        'unit': 'g',
+        'carbs': round(nutrition['carbs'], 2),
+        'protein': round(nutrition['protein'], 2),
+        'fat': round(nutrition['fat'], 2),
+        'calories': 0.0
+    }
+
 def parse_food_input(food_input):
     """
     Parse user input like "100g chicken breast", "1 medium apple", or "two eggs".
@@ -108,18 +232,38 @@ def parse_food_input(food_input):
     """
     cleaned = food_input.strip()
 
+    # Define valid measurement units
+    valid_units = {
+        'g', 'gram', 'grams', 'kg', 'kilogram', 'kilograms',
+        'oz', 'ounce', 'ounces', 'lb', 'lbs', 'pound', 'pounds',
+        'ml', 'milliliter', 'milliliters', 'l', 'liter', 'liters',
+        'cup', 'cups', 'tbsp', 'tablespoon', 'tablespoons',
+        'tsp', 'teaspoon', 'teaspoons', 'piece', 'pieces',
+        'serving', 'servings', 'slice', 'slices'
+    }
+
     # Pattern: number + optional unit + food name (e.g., "100g chicken breast")
     match = re.match(r'^(\d+(?:\.\d+)?)\s*([a-zA-Z]+)?\s+(.+)$', cleaned)
     if match:
         quantity = float(match.group(1))
         raw_unit = (match.group(2) or '').lower()
-        food_name = match.group(3).strip()
+        remaining_text = match.group(3).strip()
 
-        # If no explicit unit, decide between grams vs counted items
-        if raw_unit:
+        # Check if raw_unit is a valid measurement unit
+        if raw_unit and raw_unit in valid_units:
+            # It's a valid unit, so remaining_text is the food name
+            food_name = remaining_text
             unit = raw_unit
+        elif raw_unit:
+            # Not a valid unit - treat it as part of food name
+            food_name = f"{raw_unit} {remaining_text}"
+            # Determine unit based on food type
+            countable_keywords = ['egg', 'eggs', 'apple', 'apples', 'banana', 'bananas', 'orange', 'oranges', 'bread', 'breads', 'hamburger', 'hamburgers', 'burger', 'burgers', 'sandwich', 'sandwiches']
+            unit = 'unit' if any(k in food_name.lower() for k in countable_keywords) else 'g'
         else:
-            countable_keywords = ['egg', 'eggs', 'apple', 'apples', 'banana', 'bananas', 'orange', 'oranges']
+            # No unit detected, determine based on food type
+            food_name = remaining_text
+            countable_keywords = ['egg', 'eggs', 'apple', 'apples', 'banana', 'bananas', 'orange', 'oranges', 'bread', 'breads', 'hamburger', 'hamburgers', 'burger', 'burgers', 'sandwich', 'sandwiches']
             unit = 'unit' if any(k in food_name.lower() for k in countable_keywords) else 'g'
 
         return food_name, quantity, unit
@@ -135,212 +279,496 @@ def parse_food_input(food_input):
     # Fallback: treat as a single unit
     return cleaned, 1.0, 'unit'
 
-def search_usda_food(food_name):
+def search_csv_food(food_name):
     """
-    Search for food in USDA FoodData Central using data.gov API client.
-    Uses X-Api-Key header authentication (recommended by data.gov).
-    Implements caching to reduce API calls and avoid rate limits.
+    Search for food in the loaded CSV data.
+    Returns a dictionary matching the expected format.
+    Uses improved matching: exact > prefix > word boundary > no substring fallback.
     """
-    # Check cache first
-    cache_key = food_name.lower().strip()
+    if not csv_loaded or not csv_data:
+        print("CSV data not loaded")
+        return None
+    
+    normalized_query = normalize_food_name(food_name)
+    cache_key = normalized_query
     if cache_key in _search_cache:
         print(f"[CACHE HIT] Using cached results for '{food_name}'")
         return _search_cache[cache_key]
+
+    exact_matches = []
+    prefix_matches = []
+    word_boundary_matches = []
     
-    # Make API request if not cached
-    response = data_gov_client.make_request(
-        endpoint=f"{USDA_API_URL}/foods/search",
-        params={
-            'query': food_name,
-            'pageSize': 10
-        }
+    for row in csv_data:
+        category_name = row.get('category_name', '')
+        normalized_category = normalize_food_name(category_name)
+        if not normalized_category or normalized_category == 'background':
+            continue
+        
+        if normalized_query == normalized_category:
+            # Exact match (highest priority)
+            exact_matches.append(row)
+        elif normalized_query and normalized_category.startswith(normalized_query):
+            # Prefix match (e.g., "apple" matches "apple pie") - but only if it's a word boundary
+            # Check that the next character after query is a space or end of string
+            next_pos = len(normalized_query)
+            if next_pos >= len(normalized_category) or normalized_category[next_pos] == ' ':
+                prefix_matches.append(row)
+        elif normalized_query and normalized_query in normalized_category.split():
+            # Word boundary match (e.g., "apple" is a complete word in "green apple")
+            word_boundary_matches.append(row)
+
+    # Use the best match category available
+    matching_foods = exact_matches if exact_matches else (
+        prefix_matches if prefix_matches else word_boundary_matches
     )
     
-    # Store in cache
-    if response:
-        _search_cache[cache_key] = response
-        print(f"[CACHED] Stored results for '{food_name}'")
+    if not matching_foods:
+        print(f"No foods found for '{food_name}' in CSV data")
+        return None
+    
+    # Convert CSV rows to match USDA API response format
+    foods = []
+    for food_row in matching_foods:
+        foods.append({
+            'fdcId': str(food_row.get('Reference (FDC ID)', food_row.get('category_id', ''))),
+            'description': food_row.get('category_name', ''),
+            'dataType': 'CSV',
+            'foodCategory': {'description': food_row.get('category_name', '')},
+            # Store our own data for later retrieval
+            '_csv_data': food_row
+        })
+    
+    response = {'foods': foods}
+    
+    # Cache the result
+    _search_cache[cache_key] = response
+    print(f"[CACHED] Stored results for '{food_name}' - Found {len(foods)} items")
     
     return response
 
-def get_food_nutrition(fdc_id, quantity, unit):
+def get_food_nutrition_csv(fdc_id, csv_food_row, quantity, unit):
     """
-    Get detailed nutrition info for a food item using data.gov API client.
-    Implements caching to reduce API calls and avoid rate limits.
-    fdc_id: FDC ID from search results
+    Get nutrition info from CSV data.
+    csv_food_row: The CSV row dictionary containing nutrition data
     quantity: amount user consumed
     unit: unit of measurement (g, cup, etc.)
     """
-    # Check cache first (only cache by FDC ID, calculate quantity later)
-    if fdc_id in _nutrition_cache:
-        print(f"[CACHE HIT] Using cached nutrition for FDC ID {fdc_id}")
-        food_data = _nutrition_cache[fdc_id]
-    else:
-        # Make API request if not cached
-        food_data = data_gov_client.make_request(
-            endpoint=f"{USDA_API_URL}/food/{fdc_id}"
-        )
-        if food_data:
-            _nutrition_cache[fdc_id] = food_data
-            print(f"[CACHED] Stored nutrition data for FDC ID {fdc_id}")
+    print(f"\nCSV Nutrition Data for {csv_food_row.get('category_name', 'Unknown')}")
     
-    if food_data:
+    food_name = csv_food_row.get('category_name', '')
+    
+    # Extract nutrition values from CSV (values are per gram)
+    try:
+        cal_str = str(csv_food_row.get('Calories (kcal/g)', '0') or '0').strip()
+        calories_per_gram = float(cal_str) if cal_str else 0
         
-        print(f"\n=== USDA API Response for FDC ID {fdc_id} ===")
-        print(f"Food Description: {food_data.get('description', 'N/A')}")
-        print(f"Food Category: {food_data.get('foodCategory', {}).get('description', 'N/A')}")
-        print(f"Data Type: {food_data.get('dataType', 'N/A')}")
+        prot_str = str(csv_food_row.get('Protein (g/g)', '0') or '0').strip()
+        protein_per_gram = float(prot_str) if prot_str else 0
         
-        # Extract nutrition facts - more flexible matching
-        nutrition_facts = {'carbs': 0, 'protein': 0, 'fat': 0}
+        carbs_str = str(csv_food_row.get('Carbohydrates (g/g)', '0') or '0').strip()
+        carbs_per_gram = float(carbs_str) if carbs_str else 0
         
-        if 'foodNutrients' in food_data:
-            print(f"\nFound {len(food_data['foodNutrients'])} nutrients")
-            for nutrient in food_data['foodNutrients']:
-                # Get nutrient info with different possible structures
-                nutrient_info = nutrient.get('nutrient', {})
-                nutrient_name = nutrient_info.get('name', '').lower()
-                
-                # Try different value fields based on data type
-                value = nutrient.get('amount') or nutrient.get('value', 0)
-                
-                print(f"  - {nutrient_name}: {value}")
-                
-                # Match carbohydrates (more flexible)
-                if 'carbohydrate' in nutrient_name:
-                    if 'by difference' in nutrient_name or 'total' in nutrient_name:
-                        if nutrition_facts['carbs'] == 0:  # Only take first match
-                            nutrition_facts['carbs'] = value
-                            print(f"    ✓ MATCHED as carbs")
-                
-                # Match protein
-                elif 'protein' in nutrient_name:
-                    if nutrition_facts['protein'] == 0:
-                        nutrition_facts['protein'] = value
-                        print(f"    ✓ MATCHED as protein")
-                
-                # Match fat (try multiple variations)
-                elif 'fat' in nutrient_name or 'lipid' in nutrient_name:
-                    if 'total' in nutrient_name or nutrient_name == 'total lipid (fat)':
-                        if nutrition_facts['fat'] == 0:
-                            nutrition_facts['fat'] = value
-                            print(f"    ✓ MATCHED as fat")
+        fat_str = str(csv_food_row.get('Fat (g/g)', '0') or '0').strip()
+        fat_per_gram = float(fat_str) if fat_str else 0
         
-        print(f"\nExtracted nutrition: {nutrition_facts}")
+        density_str = str(csv_food_row.get('Density (g/ml)', '1') or '1').strip()
+        density = float(density_str) if density_str else 1
+    except Exception as e:
+        print(f"Error parsing nutrition values: {e}")
+        return None
+    
+    print(f"Food: {food_name}")
+    print(f"Nutrition per gram: Calories={calories_per_gram}, Protein={protein_per_gram}g, Carbs={carbs_per_gram}g, Fat={fat_per_gram}g")
+    
+    # Convert quantity to grams
+    quantity_in_grams = quantity
+    unit_lower = unit.lower()
+    food_name_lower = food_name.lower()
+    
+    # Descriptive sizes with USDA-style defaults
+    if unit_lower in ['small', 'sm']:
+        if 'egg' in food_name_lower:
+            quantity_in_grams = quantity * 50
+        elif 'apple' in food_name_lower:
+            quantity_in_grams = quantity * 149
+        elif 'banana' in food_name_lower:
+            quantity_in_grams = quantity * 101
+        else:
+            quantity_in_grams = quantity * 100
+    
+    elif unit_lower in ['medium', 'med', 'md']:
+        if 'egg' in food_name_lower:
+            quantity_in_grams = quantity * 60
+        elif 'apple' in food_name_lower:
+            quantity_in_grams = quantity * 182
+        elif 'banana' in food_name_lower:
+            quantity_in_grams = quantity * 118
+        elif 'orange' in food_name_lower:
+            quantity_in_grams = quantity * 131
+        else:
+            quantity_in_grams = quantity * 150
+    
+    elif unit_lower in ['large', 'lg', 'big']:
+        if 'egg' in food_name_lower:
+            quantity_in_grams = quantity * 70
+        elif 'apple' in food_name_lower:
+            quantity_in_grams = quantity * 223
+        elif 'banana' in food_name_lower:
+            quantity_in_grams = quantity * 136
+        else:
+            quantity_in_grams = quantity * 200
+    
+    # Volume units (using density if available)
+    elif unit_lower in ['cup', 'cups']:
+        quantity_in_grams = quantity * 240 * density
+    elif unit_lower in ['tbsp', 'tablespoon', 'tablespoons']:
+        quantity_in_grams = quantity * 15 * density
+    elif unit_lower in ['tsp', 'teaspoon', 'teaspoons']:
+        quantity_in_grams = quantity * 5 * density
+    
+    # Weight units
+    elif unit_lower in ['oz', 'ounce', 'ounces']:
+        quantity_in_grams = quantity * 28.35
+    elif unit_lower in ['lb', 'lbs', 'pound', 'pounds']:
+        quantity_in_grams = quantity * 453.59
+    elif unit_lower in ['g', 'gram', 'grams']:
+        quantity_in_grams = quantity
+    
+    # Liquid volume (ml)
+    elif unit_lower in ['ml', 'milliliter', 'milliliters']:
+        quantity_in_grams = quantity * density
+    
+    # Countable items
+    elif unit_lower in ['piece', 'pieces', 'item', 'items', 'unit', 'units', 'egg', 'eggs', 'slice', 'slices', 'toast', 'toasts']:
+        default_piece_weight = 150
+        if 'egg' in food_name_lower:
+            default_piece_weight = 60
+        elif 'banana' in food_name_lower:
+            default_piece_weight = 118
+        elif 'apple' in food_name_lower:
+            default_piece_weight = 182
+        elif 'orange' in food_name_lower:
+            default_piece_weight = 131
+        elif 'bread' in food_name_lower:
+            default_piece_weight = 30  # 1 slice of bread ≈ 30g
+        quantity_in_grams = quantity * default_piece_weight
+    
+    else:
+        # Unknown unit - assume grams
+        print(f"[WARNING] Unknown unit '{unit}' - treating quantity as grams")
+        quantity_in_grams = quantity
+    
+    print(f"Input: {quantity}{unit} = {quantity_in_grams:.2f}g")
+    
+    # Calculate based on per-gram values
+    nutrition = {
+        'carbs': round(carbs_per_gram * quantity_in_grams, 2),
+        'protein': round(protein_per_gram * quantity_in_grams, 2),
+        'fat': round(fat_per_gram * quantity_in_grams, 2),
+        'calories': round(calories_per_gram * quantity_in_grams, 2)
+    }
+    
+    print(f"Final nutrition: {nutrition}")
+    print("=" * 50 + "\n")
+    
+    return {
+        'food_name': food_name,
+        'carbs': nutrition['carbs'],
+        'protein': nutrition['protein'],
+        'fat': nutrition['fat'],
+        'calories': nutrition['calories'],
+        'quantity': quantity,
+        'unit': unit,
+        'serving_size': 1  # CSV data is per gram, so serving is 1g
+    }
+
+# USDA API fallback functions
+# Prefer USDA_API_KEY; fallback to DATA_GOV_API_KEY; final fallback to DEMO_KEY.
+USDA_API_KEY = os.getenv("USDA_API_KEY") or os.getenv("DATA_GOV_API_KEY", "DEMO_KEY")
+USDA_BASE_URL = "https://api.nal.usda.gov/fdc/v1"
+
+# Doubao LLM API configuration for nutrition queries
+DOUBAO_API_KEY = os.getenv("DOUBAO_API_KEY", "e1051380-9eac-4253-bd06-cc4fb1fb53db")
+DOUBAO_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+DOUBAO_MODEL = "doubao-1-5-pro-32k-250115"
+
+def query_doubao_nutrition(food_name, quantity, unit):
+    """
+    Query Doubao LLM API to get nutrition data for a food.
+    Returns nutrition dict or None.
+    """
+    try:
+        prompt = f"{quantity}{unit} {food_name} has how many carbs, protein and fat? answer in the format: carbs: xxg, protein: xxg, fat: xxg. and do not say anything else"
         
-        # Get serving size - check multiple fields
-        serving_size = 100  # default assumption
-        if 'servingSizeUnit' in food_data and 'servingSize' in food_data:
-            try:
-                if food_data.get('servingSizeUnit', 'g').lower() == 'g':
-                    serving_size = float(food_data['servingSize'])
-                else:
-                    serving_size = 100
-            except:
-                serving_size = 100
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {DOUBAO_API_KEY}"
+        }
         
-        print(f"Serving size: {serving_size}g")
+        payload = {
+            "model": DOUBAO_MODEL,
+            "messages": [
+                {"role": "system", "content": "你是一个营养学家助手，专门提供食物的营养信息。"},
+                {"role": "user", "content": prompt}
+            ]
+        }
         
-        # Convert quantity to grams if needed
+        print(f"[Doubao] Querying nutrition for: {prompt}")
+        response = requests.post(DOUBAO_BASE_URL, json=payload, headers=headers, timeout=15)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        # Extract the assistant's response
+        if 'choices' in data and len(data['choices']) > 0:
+            message = data['choices'][0].get('message', {})
+            content = message.get('content', '').strip()
+            print(f"[Doubao] Response: {content}")
+            
+            # Parse the response for nutrition values
+            # Expected format: "carbs: 25g, protein: 5g, fat: 1g"
+            nutrition = {
+                'carbs': 0.0,
+                'protein': 0.0,
+                'fat': 0.0,
+                'calories': 0.0
+            }
+            
+            # Extract values using regex
+            carbs_match = re.search(r'carbs?\s*:\s*([\d.]+)', content, re.IGNORECASE)
+            protein_match = re.search(r'protein\s*:\s*([\d.]+)', content, re.IGNORECASE)
+            fat_match = re.search(r'fat\s*:\s*([\d.]+)', content, re.IGNORECASE)
+            
+            if carbs_match:
+                nutrition['carbs'] = float(carbs_match.group(1))
+            if protein_match:
+                nutrition['protein'] = float(protein_match.group(1))
+            if fat_match:
+                nutrition['fat'] = float(fat_match.group(1))
+            
+            if _is_nutrition_meaningful({'carbs': nutrition['carbs'], 'protein': nutrition['protein'], 'fat': nutrition['fat']}):
+                result = {
+                    'food_name': food_name,
+                    'carbs': round(nutrition['carbs'], 2),
+                    'protein': round(nutrition['protein'], 2),
+                    'fat': round(nutrition['fat'], 2),
+                    'calories': nutrition['calories'],
+                    'quantity': quantity,
+                    'unit': unit,
+                    'source': 'Doubao LLM'
+                }
+                print(f"[Doubao] Extracted nutrition: {result}")
+                return result
+            else:
+                print(f"[Doubao] Response parsed but nutrition not meaningful: {nutrition}")
+                return None
+        else:
+            print(f"[Doubao] No choices in response")
+            return None
+            
+    except Exception as e:
+        print(f"[Doubao] Error querying nutrition: {e}")
+        return None
+
+def search_usda_food(food_name):
+    """
+    Search for food in USDA FoodData Central via API.
+    Returns a dictionary with search results or None if not found.
+    """
+    try:
+        print(f"\nSearching USDA API for: {food_name}")
+        url = f"{USDA_BASE_URL}/foods/search"
+        merged = []
+        seen_ids = set()
+
+        query_candidates = [food_name]
+        normalized = normalize_food_name(food_name)
+        if normalized and normalized != food_name:
+            query_candidates.append(normalized)
+
+        # Two-pass strategy: broad searches with increasing pageSize
+        # USDA API doesn't support dataType filtering in search params
+        for q in query_candidates:
+            for pass_num in range(2):
+                page_size = 25 if pass_num == 0 else 50
+                params = {
+                    'query': q,
+                    'pageSize': page_size,
+                    'api_key': USDA_API_KEY
+                }
+                try:
+                    response = requests.get(url, params=params, timeout=10)
+                    response.raise_for_status()
+                    data = response.json()
+                    foods = data.get('foods', [])
+                    for item in foods:
+                        fdc_id = str(item.get('fdcId', ''))
+                        if not fdc_id or fdc_id in seen_ids:
+                            continue
+                        seen_ids.add(fdc_id)
+                        merged.append(item)
+                except Exception as pass_err:
+                    print(f"[USDA] Pass {pass_num + 1} error for '{q}': {pass_err}")
+                    continue
+
+        if merged:
+            print(f"[USDA] Found {len(merged)} merged results for '{food_name}'")
+            return {'foods': merged}
+
+        print(f"[USDA] No results found for '{food_name}'")
+        return None
+    except Exception as e:
+        print(f"[USDA] Error searching for '{food_name}': {e}")
+        return None
+
+def _is_nutrition_meaningful(nutrition):
+    if not nutrition:
+        return False
+    return any(float(nutrition.get(k, 0) or 0) > 0 for k in ['carbs', 'protein', 'fat', 'calories'])
+
+def _extract_usda_nutrition_per_100g(nutrients):
+    """Extract macros from USDA nutrients across different payload shapes."""
+    nutrition_per_100g = {
+        'calories': 0.0,
+        'protein': 0.0,
+        'carbs': 0.0,
+        'fat': 0.0
+    }
+
+    # USDA nutrientNumber reference: 1008=Energy kcal, 1003=Protein, 1005=Carbs, 1004=Fat
+    for nutrient in nutrients or []:
+        nutrient_obj = nutrient.get('nutrient', {}) if isinstance(nutrient, dict) else {}
+
+        nutrient_name = str(
+            nutrient_obj.get('name')
+            or nutrient.get('nutrientName')
+            or ''
+        ).strip().lower()
+
+        nutrient_number = str(
+            nutrient_obj.get('number')
+            or nutrient.get('nutrientNumber')
+            or ''
+        ).strip()
+
+        amount = nutrient.get('amount')
+        if amount is None:
+            amount = nutrient.get('value', 0)
+
+        try:
+            amount = float(amount or 0)
+        except Exception:
+            amount = 0.0
+
+        if nutrient_number == '1008' or ('energy' in nutrient_name and 'kcal' in nutrient_name):
+            nutrition_per_100g['calories'] = amount
+        elif nutrient_number == '1003' or 'protein' in nutrient_name:
+            nutrition_per_100g['protein'] = amount
+        elif nutrient_number == '1005' or ('carbohydrate' in nutrient_name and 'fiber' not in nutrient_name):
+            nutrition_per_100g['carbs'] = amount
+        elif nutrient_number == '1004' or ('fat' in nutrient_name and ('total' in nutrient_name or 'lipid' in nutrient_name)):
+            nutrition_per_100g['fat'] = amount
+
+    return nutrition_per_100g
+
+def get_food_nutrition_usda(fdc_id, quantity, unit):
+    """
+    Get nutrition info from USDA API.
+    fdc_id: FDC ID from USDA food search
+    quantity: amount user consumed
+    unit: unit of measurement (g, cup, etc.)
+    """
+    try:
+        print(f"\nFetching USDA nutrition data for FDC ID: {fdc_id}")
+        url = f"{USDA_BASE_URL}/food/{fdc_id}"
+        params = {'api_key': USDA_API_KEY}
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        
+        food_data = response.json()
+        food_name = food_data.get('description', 'Unknown Food')
+        nutrients = food_data.get('foodNutrients', [])
+        
+        # Extract key nutrients (per 100g serving from USDA)
+        nutrition_per_100g = _extract_usda_nutrition_per_100g(nutrients)
+        
+        # Convert quantity to grams (similar logic as CSV)
         quantity_in_grams = quantity
         unit_lower = unit.lower()
-        food_desc = food_data.get('description', '').lower()
-
+        food_name_lower = food_name.lower()
+        
         # Descriptive sizes with USDA-style defaults
         if unit_lower in ['small', 'sm']:
-            if 'egg' in food_desc:
-                quantity_in_grams = quantity * 50
-            elif 'apple' in food_desc:
-                quantity_in_grams = quantity * 149
-            elif 'banana' in food_desc:
-                quantity_in_grams = quantity * 101
-            else:
-                quantity_in_grams = quantity * 100
-
+            quantity_in_grams = quantity * 100
         elif unit_lower in ['medium', 'med', 'md']:
-            if 'egg' in food_desc:
-                quantity_in_grams = quantity * 60
-            elif 'apple' in food_desc:
-                quantity_in_grams = quantity * 182
-            elif 'banana' in food_desc:
-                quantity_in_grams = quantity * 118
-            elif 'orange' in food_desc:
-                quantity_in_grams = quantity * 131
-            else:
-                quantity_in_grams = quantity * 150
-
+            quantity_in_grams = quantity * 150
         elif unit_lower in ['large', 'lg', 'big']:
-            if 'egg' in food_desc:
-                quantity_in_grams = quantity * 70
-            elif 'apple' in food_desc:
-                quantity_in_grams = quantity * 223
-            elif 'banana' in food_desc:
-                quantity_in_grams = quantity * 136
-            else:
-                quantity_in_grams = quantity * 200
-
-        # Volume units
+            quantity_in_grams = quantity * 200
         elif unit_lower in ['cup', 'cups']:
             quantity_in_grams = quantity * 240
         elif unit_lower in ['tbsp', 'tablespoon', 'tablespoons']:
             quantity_in_grams = quantity * 15
         elif unit_lower in ['tsp', 'teaspoon', 'teaspoons']:
             quantity_in_grams = quantity * 5
-
-        # Weight units
         elif unit_lower in ['oz', 'ounce', 'ounces']:
             quantity_in_grams = quantity * 28.35
         elif unit_lower in ['lb', 'lbs', 'pound', 'pounds']:
             quantity_in_grams = quantity * 453.59
-        elif unit_lower in ['g', 'gram', 'grams']:
-            quantity_in_grams = quantity
-
-        # Liquid volume
         elif unit_lower in ['ml', 'milliliter', 'milliliters']:
             quantity_in_grams = quantity
-
-        # Countable items default
-        elif unit_lower in ['piece', 'pieces', 'item', 'items', 'unit', 'units', 'egg', 'eggs']:
-            # Use food-specific defaults when counting items
+        elif unit_lower in ['g', 'gram', 'grams']:
+            quantity_in_grams = quantity
+        elif unit_lower in ['piece', 'pieces', 'item', 'items', 'unit', 'units', 'egg', 'eggs', 'slice', 'slices', 'toast', 'toasts']:
             default_piece_weight = 150
-            if 'egg' in food_desc:
-                default_piece_weight = 60
-            elif 'banana' in food_desc:
-                default_piece_weight = 118
-            elif 'apple' in food_desc:
-                default_piece_weight = 182
-            elif 'orange' in food_desc:
-                default_piece_weight = 131
             quantity_in_grams = quantity * default_piece_weight
-
         else:
-            # Unknown unit - assume grams
-            print(f"[WARNING] Unknown unit '{unit}' - treating quantity as grams")
             quantity_in_grams = quantity
         
-        print(f"Input: {quantity}{unit} = {quantity_in_grams}g")
+        # Calculate nutrition (USDA provides per 100g, so scale accordingly)
+        multiplier = quantity_in_grams / 100.0
         
-        # Scale nutrition values
-        scale_factor = quantity_in_grams / serving_size
-        scaled_nutrition = {}
-        for key, val in nutrition_facts.items():
-            scaled_nutrition[key] = round(val * scale_factor, 2)
+        nutrition = {
+            'carbs': round(nutrition_per_100g['carbs'] * multiplier, 2),
+            'protein': round(nutrition_per_100g['protein'] * multiplier, 2),
+            'fat': round(nutrition_per_100g['fat'] * multiplier, 2),
+            'calories': round(nutrition_per_100g['calories'] * multiplier, 2)
+        }
         
-        print(f"Scale factor: {scale_factor}")
-        print(f"Final scaled nutrition: {scaled_nutrition}")
-        print("=" * 50 + "\n")
+        print(f"USDA Nutrition: {nutrition} (from {quantity}{unit} = {quantity_in_grams:.2f}g)")
         
-        return {
-            'food_name': food_data.get('description', ''),
-            'carbs': scaled_nutrition.get('carbs', 0),
-            'protein': scaled_nutrition.get('protein', 0),
-            'fat': scaled_nutrition.get('fat', 0),
+        result = {
+            'food_name': food_name,
+            'carbs': nutrition['carbs'],
+            'protein': nutrition['protein'],
+            'fat': nutrition['fat'],
+            'calories': nutrition['calories'],
             'quantity': quantity,
             'unit': unit,
-            'serving_size': serving_size
+            'source': 'USDA API'
         }
-    print(f"Error: Could not retrieve food nutrition data for FDC ID {fdc_id}")
-    return None
+        if not _is_nutrition_meaningful(result):
+            print(f"[USDA] Nutrition data incomplete for FDC ID {fdc_id}, skipping this candidate")
+            return None
+
+        return result
+    except Exception as e:
+        print(f"[USDA] Error fetching nutrition: {e}")
+        return None
+
+def get_food_nutrition_with_fallback(food_name, quantity, unit):
+    """
+    Query Doubao LLM API for nutrition data.
+    Returns tuple: (nutrition_dict_or_none, source_label)
+    """
+    nutrition = query_doubao_nutrition(food_name, quantity, unit)
+    if nutrition:
+        return nutrition, "Doubao LLM"
+    return None, ""
+
+# Load CSV data on app startup
+with app.app_context():
+    load_nutrition_csv()
 
 @app.route('/')
 def main():
@@ -429,7 +857,7 @@ def calculate_cube_dimension(volume):
 
     return 0, 0, 0 # Return zero if no valid dimensions are found
 
-def mesh_generation(name, weight, density): #g/cm3
+def mesh_generation(name, weight, density, z_offset=0.0): #g/cm3, z_offset in mm
     x, y, z = calculate_cube_dimension(weight / density) # in mm
     # print(name, weight, density, weight / density, x, y, z)
     if (x == 0 or y == 0 or z == 0): return 0, 0, 0
@@ -445,15 +873,19 @@ def mesh_generation(name, weight, density): #g/cm3
         print(f"[WARN] Failed to import numpy-stl: {e}. Skipping STL generation.")
         return x, y, z
 
-    vertices = np.array([[
-        0, 0, 0],
-        [x, 0, 0],
-        [x, y, 0],
-        [0, y, 0],
-        [0, 0, z],
-        [x, 0, z],
-        [x, y, z],
-        [0, y, z]])
+    # Center the box on the XY plane so all items share the same vertical axis.
+    # z_offset shifts this item up to sit on top of the previous item.
+    hx, hy = x / 2.0, y / 2.0
+    z0, z1 = z_offset, z_offset + z
+    vertices = np.array([
+        [-hx, -hy, z0],
+        [ hx, -hy, z0],
+        [ hx,  hy, z0],
+        [-hx,  hy, z0],
+        [-hx, -hy, z1],
+        [ hx, -hy, z1],
+        [ hx,  hy, z1],
+        [-hx,  hy, z1]])
 
     faces = np.array([[
         0,3,1],
@@ -596,6 +1028,7 @@ def recommend(gender, age, height, weight, carbohydrate, protein, fat, activity,
         indices, amounts, norm = solutions[index]
         material_mesh_list = []
         carbohydrate_supplement = protein_supplement = fat_supplement = 0
+        cumulative_z = 0.0  # running z offset so each food item stacks on top of the previous
         # print(amounts)
         for i in range(len(amounts)):             
             amounts[i] = round(amounts[i], 2)
@@ -604,20 +1037,22 @@ def recommend(gender, age, height, weight, carbohydrate, protein, fat, activity,
             carbohydrate_supplement += amounts[i] * W[indices[i]][0]
             protein_supplement += amounts[i] * W[indices[i]][1]
             fat_supplement += amounts[i] * W[indices[i]][2]
+            z_off = cumulative_z
             # Record manifest for on-demand regeneration, regardless of generation mode
             try:
                 manifest = _load_manifest()
-                manifest[mesh_name] = { 'amount': float(amounts[i]), 'density': float(density[indices[i]]) }
+                manifest[mesh_name] = { 'amount': float(amounts[i]), 'density': float(density[indices[i]]), 'z_offset': float(z_off) }
                 _save_manifest(manifest)
             except Exception as mf_err:
                 print(f"[WARN] Failed to update manifest for {mesh_name}: {mf_err}")
 
             # Decide whether to generate STL based on MESH_MODE
             generate_mesh = (MESH_MODE == 'all') or (MESH_MODE == 'first' and index == 0)
-            x, y, z = mesh_generation(mesh_name, amounts[i], density[indices[i]]) if generate_mesh else calculate_cube_dimension(amounts[i] / density[indices[i]])
+            x, y, z = mesh_generation(mesh_name, amounts[i], density[indices[i]], z_offset=z_off) if generate_mesh else calculate_cube_dimension(amounts[i] / density[indices[i]])
             # Show download links when meshes are allowed; on-demand regen will be used if file is missing
             mesh_field = mesh_name if MESH_MODE != 'none' and x and y and z else ''
             if x and y and z:
+                cumulative_z += z  # advance the stack by this item's thickness
                 material_mesh_list.append({'name': name[indices[i]], 'mesh': mesh_field, 'gram': amounts[i], 'x': round(x, 2), 'y': round(y, 2), 'z': round(z, 2)})
         results.append((material_mesh_list, round(carbohydrate_supplement, 2), round(protein_supplement, 2), round(fat_supplement, 2)))            
 
@@ -736,7 +1171,7 @@ def chatbot():
 
 @app.route('/api/search-food', methods=['POST'])
 def api_search_food():
-    """Search for food in USDA database and return parsed nutrition"""
+    """Search for food in CSV data and return parsed nutrition. Supports multiple foods separated by commas."""
     try:
         data = request.json
         food_input = data.get('food_input', '').strip()
@@ -744,45 +1179,127 @@ def api_search_food():
         if not food_input:
             return jsonify({'error': 'No food input provided'}), 400
         
-        # Parse user input
-        food_name, quantity, unit = parse_food_input(food_input)
+        # Split by comma variants and semicolons to handle multiple foods
+        food_items = [item.strip() for item in re.split(r'[,，;]+', food_input)]
         
-        # Search USDA API
-        search_results = search_usda_food(food_name)
+        # Store all nutrition data and individual results
+        total_nutrition = {
+            'carbs': 0,
+            'protein': 0,
+            'fat': 0,
+            'calories': 0
+        }
+        individual_foods = []
+        errors = []
+        
+        # Process each food item
+        for food_item in food_items:
+            if not food_item:
+                continue
 
-        # Handle upstream errors (rate limit / connectivity)
-        if search_results is None:
+            # Handle direct macro entries in mixed input (e.g., "100g carb")
+            direct_macro = parse_direct_macro_input(food_item)
+            if direct_macro is not None:
+                total_nutrition['carbs'] += direct_macro.get('carbs', 0)
+                total_nutrition['protein'] += direct_macro.get('protein', 0)
+                total_nutrition['fat'] += direct_macro.get('fat', 0)
+                total_nutrition['calories'] += direct_macro.get('calories', 0)
+                individual_foods.append(direct_macro)
+                continue
+                
+            # Parse user input
+            food_name, quantity, unit = parse_food_input(food_item)
+            
+            # Resolve nutrition with CSV-first + USDA fallback
+            nutrition, source = get_food_nutrition_with_fallback(food_name, quantity, unit)
+            if not nutrition:
+                # Both CSV and USDA failed - ask user to search manually
+                errors.append({
+                    'food': food_item,
+                    'message': f"'{food_item}' not found in local database or USDA API. Please search manually and enter nutrition values.",
+                    'manual_input': True
+                })
+                continue
+            
+            if not nutrition:
+                errors.append({
+                    'food': food_item,
+                    'message': f"Could not retrieve nutrition for '{food_item}'",
+                    'manual_input': False
+                })
+                continue
+            
+            # Add source to nutrition data
+            nutrition['source'] = source
+            
+            # Add to total nutrition
+            total_nutrition['carbs'] += nutrition.get('carbs', 0)
+            total_nutrition['protein'] += nutrition.get('protein', 0)
+            total_nutrition['fat'] += nutrition.get('fat', 0)
+            total_nutrition['calories'] += nutrition.get('calories', 0)
+            
+            # Store individual food info
+            individual_foods.append({
+                'food_name': nutrition.get('food_name', ''),
+                'quantity': nutrition.get('quantity', 0),
+                'unit': nutrition.get('unit', ''),
+                'carbs': nutrition.get('carbs', 0),
+                'protein': nutrition.get('protein', 0),
+                'fat': nutrition.get('fat', 0),
+                'calories': nutrition.get('calories', 0),
+                'source': nutrition.get('source', 'Unknown')
+            })
+        
+        # Check if we successfully processed at least one food
+        if not individual_foods:
+            if errors:
+                # Separate errors into manual input needed vs other errors
+                manual_input_foods = [e for e in errors if isinstance(e, dict) and e.get('manual_input')]
+                other_errors = [e for e in errors if isinstance(e, dict) and not e.get('manual_input')]
+                
+                error_message = 'Could not find foods in any database'
+                if manual_input_foods:
+                    error_message += '. Please search the internet and manually enter nutrition values for: ' + ', '.join([e['food'] for e in manual_input_foods])
+                
+                return jsonify({
+                    'error': error_message,
+                    'all_errors': errors,
+                    'manual_input_required': len(manual_input_foods) > 0,
+                    'manual_input_foods': manual_input_foods
+                }), 404
             return jsonify({
-                'error': 'Upstream nutrition API unavailable (possible rate limit or connectivity issue). Please wait a bit and try again.',
-                'suggestion': 'If this keeps happening, request a higher API limit or try later.'
-            }), 503
+                'error': 'No valid food items provided',
+                'suggestion': 'Please provide at least one food item'
+            }), 400
         
-        if 'foods' not in search_results or len(search_results['foods']) == 0:
-            return jsonify({
-                'error': f'No foods found for "{food_name}"',
-                'suggestion': 'Try searching for a more specific food name'
-            }), 404
-        
-        # Get the first result's detailed nutrition
-        top_food = search_results['foods'][0]
-        fdc_id = top_food.get('fdcId')
-        
-        nutrition = get_food_nutrition(fdc_id, quantity, unit)
-        
-        if not nutrition:
-            return jsonify({
-                'error': 'Could not retrieve nutrition information (upstream API may be rate limited).',
-                'suggestion': 'Wait a few minutes and try again, or reduce rapid repeated searches.'
-            }), 503
-        
-        return jsonify({
+        # Build response
+        response = {
             'success': True,
-            'nutrition': nutrition,
-            'original_input': food_input
-        }), 200
+            'nutrition': {
+                'carbs': round(total_nutrition['carbs'], 2),
+                'protein': round(total_nutrition['protein'], 2),
+                'fat': round(total_nutrition['fat'], 2),
+                'calories': round(total_nutrition['calories'], 2)
+            },
+            'individual_foods': individual_foods,
+            'original_input': food_input,
+            'foods_processed': len(individual_foods)
+        }
+        
+        # Include warnings if some items failed
+        if errors:
+            manual_input_foods = [e for e in errors if isinstance(e, dict) and e.get('manual_input')]
+            response['warnings'] = errors
+            if manual_input_foods:
+                response['manual_input_required'] = True
+                response['manual_input_foods'] = manual_input_foods
+        
+        return jsonify(response), 200
     
     except Exception as e:
         print(f"Error in api_search_food: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/calculate-recommendation', methods=['POST'])
@@ -790,6 +1307,7 @@ def api_calculate_recommendation():
     """Calculate nutrition recommendation based on user info and daily intake"""
     try:
         data = request.json or {}
+        user_id = data.get('user_id')
         user_info = data.get('user_info', {})
         daily_nutrition = data.get('daily_nutrition', {})
 
@@ -894,8 +1412,28 @@ def api_calculate_recommendation():
         if note:
             recommend_dict['note'] = note
         
+        saved_record = save_user_record(
+            user_id=user_id,
+            user_info={
+                'gender': gender,
+                'age': age,
+                'height': height,
+                'weight': weight,
+                'activity': activity,
+                'diet': diet,
+                'preference': preference,
+            },
+            daily_nutrition={
+                'carbs': carbs,
+                'protein': protein,
+                'fat': fat,
+            },
+            recommendation=recommend_dict
+        )
+
         return jsonify({
             'success': True,
+            'user_id': saved_record.get('user_id'),
             'recommendation': recommend_dict
         }), 200
     
@@ -904,6 +1442,80 @@ def api_calculate_recommendation():
         if DIAG_MODE:
             return jsonify({'error': str(e)}), 500
         return jsonify({'error': 'Recommendation failed. Please try again later.'}), 500
+
+@app.route('/api/user-records', methods=['GET', 'POST'])
+def api_user_records():
+    """Create/list backend user records for multi-user support."""
+    try:
+        if request.method == 'GET':
+            records = _load_user_records()
+            # Return full records for UI usage (including user_info for display)
+            summaries = []
+            for _, record in records.items():
+                summaries.append({
+                    'id': record.get('user_id'),
+                    'user_id': record.get('user_id'),
+                    'created_at': record.get('created_at'),
+                    'updated_at': record.get('updated_at'),
+                    'user_info': record.get('user_info', {}),
+                    'history_count': len(record.get('history', []))
+                })
+            summaries.sort(key=lambda r: r.get('updated_at', ''), reverse=True)
+            return jsonify({'success': True, 'records': summaries}), 200
+
+        data = request.json or {}
+        
+        # Handle creation with just a name (from multi-user UI)
+        if 'name' in data and 'user_id' not in data:
+            user_id = str(uuid.uuid4())
+            user_info = {'name': data.get('name')}
+            saved = save_user_record(user_id=user_id, user_info=user_info)
+            return jsonify({
+                'success': True, 
+                'user': {
+                    'id': user_id,
+                    'user_id': user_id,
+                    'created_at': saved.get('created_at'),
+                    'updated_at': saved.get('updated_at'),
+                    'user_info': user_info
+                }
+            }), 200
+        
+        # Handle normal case (full user record update)
+        user_id = data.get('user_id')
+        user_info = data.get('user_info', {})
+        saved = save_user_record(user_id=user_id, user_info=user_info)
+        return jsonify({'success': True, 'record': saved}), 200
+    except Exception as e:
+        print(f"Error in api_user_records: {e}")
+        if DIAG_MODE:
+            return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'User record operation failed.'}), 500
+
+@app.route('/api/user-records/<user_id>', methods=['GET', 'DELETE'])
+def api_user_record_detail(user_id):
+    """Fetch one full user record including history, or delete a user."""
+    try:
+        if request.method == 'DELETE':
+            # Delete user record
+            records = _load_user_records()
+            if user_id not in records:
+                return jsonify({'error': 'User record not found'}), 404
+            
+            del records[user_id]
+            _save_user_records(records)
+            return jsonify({'success': True, 'message': 'User deleted'}), 200
+        
+        # GET request
+        record = get_user_record(user_id)
+        if not record:
+            return jsonify({'error': 'User record not found'}), 404
+        return jsonify({'success': True, 'record': record}), 200
+    except Exception as e:
+        print(f"Error in api_user_record_detail: {e}")
+        if DIAG_MODE:
+            return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'Unable to fetch user record.'}), 500
 
 @app.route('/download-stl/<path:filename>', methods=['GET'])
 def download_stl(filename):
@@ -921,8 +1533,8 @@ def download_stl(filename):
                 meta = manifest.get(filename)
                 if meta and 'amount' in meta and 'density' in meta:
                     try:
-                        # Regenerate STL file
-                        mesh_generation(filename, float(meta['amount']), float(meta['density']))
+                        # Regenerate STL file (restore z_offset so stacking is preserved)
+                        mesh_generation(filename, float(meta['amount']), float(meta['density']), z_offset=float(meta.get('z_offset', 0.0)))
                     except Exception as regen_err:
                         print(f"[WARN] Regeneration failed: {regen_err}")
                 else:
@@ -973,6 +1585,49 @@ def download_stl(filename):
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({'status': 'ok'}), 200
+
+@app.route('/api/daily-intake/<user_id>', methods=['GET', 'POST'])
+def save_daily_intake(user_id):
+    """Save or retrieve daily nutrition history for a user."""
+    try:
+        records = _load_user_records()
+        if user_id not in records:
+            return jsonify({'error': 'User not found'}), 404
+
+        if request.method == 'GET':
+            history = records[user_id].get('daily_history', [])
+            return jsonify({'success': True, 'history': history}), 200
+
+        data = request.get_json() or {}
+        daily_nutrition = data.get('daily_nutrition', {})
+        recommended = data.get('recommended', {})
+        today = datetime.now().strftime('%Y-%m-%d')
+
+        user = records[user_id]
+        daily_history = user.setdefault('daily_history', [])
+
+        # Update existing entry for today or append a new one
+        today_entry = next((e for e in daily_history if e.get('date') == today), None)
+        if today_entry:
+            today_entry['nutrition'] = daily_nutrition
+            if recommended:
+                today_entry['recommended'] = recommended
+            today_entry['updated_at'] = datetime.utcnow().isoformat() + 'Z'
+        else:
+            entry = {
+                'date': today,
+                'nutrition': daily_nutrition,
+                'updated_at': datetime.utcnow().isoformat() + 'Z'
+            }
+            if recommended:
+                entry['recommended'] = recommended
+            daily_history.append(entry)
+
+        _save_user_records(records)
+        return jsonify({'success': True, 'user_id': user_id}), 200
+    except Exception as e:
+        print(f"[ERROR] Failed to save/get daily intake: {e}")
+        return jsonify({'error': str(e)}), 500
  
 # main driver function
 if __name__ == '__main__':
