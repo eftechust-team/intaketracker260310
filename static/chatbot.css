@@ -217,7 +217,7 @@
 .chat-header {
     padding: 20px;
     border-bottom: 1px solid var(--border);
-    background: linear-gradient(135deg, rgba(255, 122, 61, 0.04), rgba(255, 200, 97, 0.04));
+    background: linear-gradient(135deg, #ffe1cc 0%, #ffcfad 100%);
 }
 
 .chat-header h2 {
@@ -867,6 +867,12 @@ a.btn-primary:active {
     margin-bottom: 12px;
 }
 
+.cal-nav-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
 .cal-month-label {
     font-weight: 700;
     font-size: 16px;
@@ -885,6 +891,52 @@ a.btn-primary:active {
     transition: background 0.15s;
 }
 .cal-nav-btn:hover { background: rgba(255,122,61,0.2); }
+
+.cal-today-btn {
+    background: #fff6f1;
+    border: 1px solid #ffb88f;
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 12px;
+    font-weight: 700;
+    color: #b45309;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+}
+
+.cal-today-btn:hover {
+    background: #ffe9db;
+    border-color: #ff9f69;
+}
+
+.cal-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 10px;
+    margin: 0 0 10px 0;
+    font-size: 11px;
+    color: var(--muted);
+}
+
+.cal-legend-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+}
+
+.cal-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    border: 1px solid rgba(0, 0, 0, 0.06);
+    display: inline-block;
+}
+
+.cal-dot-good { background: #86efac; }
+.cal-dot-fair { background: #fde047; }
+.cal-dot-low { background: #93c5fd; }
+.cal-dot-high { background: #fdba74; }
+.cal-dot-excess { background: #fca5a5; }
 
 .cal-dow-header {
     display: grid;
@@ -960,8 +1012,12 @@ a.btn-primary:active {
 .cal-cell-good .cal-cell-kcal  { color: #15803d; }
 .cal-cell-fair      { background: #fef9c3; border-color: #fde047; }
 .cal-cell-fair .cal-cell-kcal  { color: #a16207; }
-.cal-cell-low       { background: #fee2e2; border-color: #fca5a5; }
-.cal-cell-low .cal-cell-kcal   { color: #b91c1c; }
+.cal-cell-low       { background: #dbeafe; border-color: #93c5fd; }
+.cal-cell-low .cal-cell-kcal   { color: #1d4ed8; }
+.cal-cell-high      { background: #ffedd5; border-color: #fdba74; }
+.cal-cell-high .cal-cell-kcal  { color: #c2410c; }
+.cal-cell-excess    { background: #fee2e2; border-color: #fca5a5; }
+.cal-cell-excess .cal-cell-kcal { color: #b91c1c; }
 
 /* Day detail panel */
 .cal-day-detail {
@@ -1121,9 +1177,49 @@ a.btn-primary:active {
 
     .chatbot-main {
         order: 0;
-        height: 58vh;
-        min-height: 340px;
+        height: 68vh;
+        min-height: 380px;
         flex-shrink: 0;
+    }
+
+    .chat-header {
+        padding: 10px 12px;
+    }
+
+    .chat-header h2 {
+        font-size: 16px;
+        margin-bottom: 2px;
+        line-height: 1.2;
+    }
+
+    .chat-header p {
+        font-size: 12px;
+        line-height: 1.25;
+    }
+
+    .input-area {
+        padding: 8px 10px;
+    }
+
+    .food-input-form {
+        gap: 6px;
+    }
+
+    #food-input {
+        padding: 10px 12px;
+        border-radius: 18px;
+    }
+
+    .btn-send {
+        padding: 10px 14px;
+        border-radius: 18px;
+        font-size: 13px;
+        min-width: 74px;
+    }
+
+    .input-hint {
+        margin-top: 4px;
+        font-size: 10px;
     }
 
     .nutrition-sidebar {
@@ -1152,8 +1248,8 @@ a.btn-primary:active {
     }
 
     .chatbot-main {
-        height: 52vh;
-        min-height: 300px;
+        height: 62vh;
+        min-height: 340px;
     }
 
     .nutrition-sidebar {
@@ -1171,20 +1267,28 @@ a.btn-primary:active {
     }
 
     .food-input-form {
-        flex-direction: column;
+        flex-direction: row;
         gap: 6px;
     }
 
     .btn-send {
-        width: 100%;
+        width: auto;
+        min-width: 70px;
+        padding: 10px 12px;
     }
 
     .chat-header {
-        padding: 12px 14px;
+        padding: 8px 10px;
     }
 
     .chat-header h2 {
-        font-size: 17px;
+        font-size: 15px;
+        margin-bottom: 1px;
+    }
+
+    .chat-header p {
+        font-size: 11px;
+        line-height: 1.2;
     }
 
     .messages-container {
@@ -1193,7 +1297,7 @@ a.btn-primary:active {
     }
 
     .input-area {
-        padding: 10px;
+        padding: 8px;
     }
 
     /* Prevent iOS auto-zoom on input focus */

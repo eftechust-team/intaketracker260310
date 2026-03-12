@@ -13,6 +13,7 @@ import csv
 import tempfile
 import uuid
 import struct
+import zipfile
 import html as _html
 import xml.etree.ElementTree as ET
 from datetime import datetime
@@ -2532,65 +2533,117 @@ def download_stl(filename):
     """Download STL file from Google Cloud Storage"""
     try:
         print(f"[DEBUG] Attempting to download STL file: {filename}")
-        if MESH_STORAGE == 'local':
-            import tempfile
-            temp_dir = tempfile.gettempdir()
-            local_path = os.path.join(temp_dir, filename)
-            if not os.path.exists(local_path):
-                print(f"[DEBUG] Local STL not found at {local_path}, attempting regeneration from manifest")
-                # Try on-demand regeneration if manifest has info
-                manifest = _load_manifest()
-                meta = manifest.get(filename)
-                if meta and 'amount' in meta and 'density' in meta:
-                    try:
-                        # Regenerate STL file (restore z_offset so stacking is preserved)
-                        mesh_generation(filename, float(meta['amount']), float(meta['density']), z_offset=float(meta.get('z_offset', 0.0)))
-                    except Exception as regen_err:
-                        print(f"[WARN] Regeneration failed: {regen_err}")
-                else:
-                    print("[DEBUG] No manifest entry for this file; cannot regenerate")
-                # Re-check existence after regeneration attempt
-                if not os.path.exists(local_path):
-                    return jsonify({'error': f'File not found (local): {filename}'}), 404
-            with open(local_path, 'rb') as f:
-                file_data = io.BytesIO(f.read())
-            file_data.seek(0)
-            print(f"[DEBUG] Serving local STL {filename}, size: {file_data.getbuffer().nbytes} bytes")
-            return send_file(
-                file_data,
-                mimetype='application/octet-stream',
-                as_attachment=True,
-                download_name=filename
-            )
-        else:
-            storage_client = storage.Client()
-            bucket = storage_client.bucket(bucket_name)
-            blob_path = f"meshes/{filename}"
-            print(f"[DEBUG] GCS blob path: {blob_path}")
-            blob = bucket.blob(blob_path)
-            
-            # Check if blob exists
-            if not blob.exists():
-                print(f"[DEBUG] Blob does not exist at path: {blob_path}")
-                return jsonify({'error': f'File not found in storage: {filename}'}), 404
-            
-            # Download to memory
-            file_data = io.BytesIO()
-            blob.download_to_file(file_data)
-            file_data.seek(0)
-            print(f"[DEBUG] Successfully downloaded {filename}, size: {file_data.getbuffer().nbytes} bytes")
-            
-            return send_file(
-                file_data,
-                mimetype='application/octet-stream',
-                as_attachment=True,
-                download_name=filename
-            )
+        stl_bytes, err = _load_stl_bytes(filename)
+        if err:
+            return jsonify({'error': err}), 404
+
+        file_data = io.BytesIO(stl_bytes)
+        file_data.seek(0)
+        print(f"[DEBUG] Serving STL {filename}, size: {file_data.getbuffer().nbytes} bytes")
+
+        return send_file(
+            file_data,
+            mimetype='application/octet-stream',
+            as_attachment=True,
+            download_name=filename
+        )
     except Exception as e:
         print(f"[ERROR] Error downloading STL: {e}")
         import traceback
         traceback.print_exc()
         return jsonify({'error': f'File not found or download failed: {str(e)}'}), 404
+
+
+def _is_safe_stl_filename(filename):
+    base = os.path.basename(str(filename or ''))
+    return bool(base) and base == filename and base.lower().endswith('.stl')
+
+
+def _load_stl_bytes(filename):
+    """Load one STL as bytes from local/GCS, regenerating local meshes when possible."""
+    if not _is_safe_stl_filename(filename):
+        return None, f'Invalid STL filename: {filename}'
+
+    if MESH_STORAGE == 'local':
+        temp_dir = tempfile.gettempdir()
+        local_path = os.path.join(temp_dir, filename)
+        if not os.path.exists(local_path):
+            print(f"[DEBUG] Local STL not found at {local_path}, attempting regeneration from manifest")
+            manifest = _load_manifest()
+            meta = manifest.get(filename)
+            if meta and 'amount' in meta and 'density' in meta:
+                try:
+                    mesh_generation(
+                        filename,
+                        float(meta['amount']),
+                        float(meta['density']),
+                        z_offset=float(meta.get('z_offset', 0.0))
+                    )
+                except Exception as regen_err:
+                    print(f"[WARN] Regeneration failed: {regen_err}")
+            if not os.path.exists(local_path):
+                return None, f'File not found (local): {filename}'
+        with open(local_path, 'rb') as f:
+            return f.read(), None
+
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(bucket_name)
+    blob_path = f"meshes/{filename}"
+    blob = bucket.blob(blob_path)
+    if not blob.exists():
+        return None, f'File not found in storage: {filename}'
+    out = io.BytesIO()
+    blob.download_to_file(out)
+    out.seek(0)
+    return out.read(), None
+
+
+@app.route('/download-stl-zip', methods=['POST'])
+def download_stl_zip():
+    """Bundle requested STL files into one ZIP for mobile/browser fallback."""
+    try:
+        payload = request.get_json(silent=True) or {}
+        files = payload.get('files', []) or []
+        folder_name = str(payload.get('folder_name', 'stl_files') or 'stl_files').strip()
+
+        if not isinstance(files, list) or not files:
+            return jsonify({'error': 'No STL files requested.'}), 400
+
+        safe_files = []
+        for f in files[:50]:
+            fname = os.path.basename(str(f or '').strip())
+            if _is_safe_stl_filename(fname):
+                safe_files.append(fname)
+        if not safe_files:
+            return jsonify({'error': 'No valid STL filenames provided.'}), 400
+
+        safe_folder = re.sub(r'[^a-zA-Z0-9_-]+', '_', folder_name).strip('_') or 'stl_files'
+
+        zip_buffer = io.BytesIO()
+        missing = []
+        with zipfile.ZipFile(zip_buffer, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
+            for fname in safe_files:
+                data, err = _load_stl_bytes(fname)
+                if err or data is None:
+                    missing.append(fname)
+                    continue
+                zf.writestr(fname, data)
+
+            if missing:
+                zf.writestr('README_missing_files.txt', 'Some files could not be included:\n' + '\n'.join(missing))
+
+        zip_buffer.seek(0)
+        return send_file(
+            zip_buffer,
+            mimetype='application/zip',
+            as_attachment=True,
+            download_name=f'{safe_folder}.zip'
+        )
+    except Exception as e:
+        print(f"[ERROR] Error creating STL ZIP: {e}")
+        if DIAG_MODE:
+            return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'Failed to create STL ZIP.'}), 500
 
 @app.route('/health', methods=['GET'])
 def health():

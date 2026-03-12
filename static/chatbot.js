@@ -1217,7 +1217,7 @@ Your daily totals have been updated. Keep tracking!
         </ul>
     </div>
     ${supplementInfo}
-    ${foods && foods.some(f => f.mesh) ? `<a href="#" class="btn-primary" style="display:inline-block; margin-top: 12px; text-decoration: none;" onclick="window._chatbot.downloadStlFolder(${index}); return false;">📁 Download STL Folder</a>${folderName ? `<div style="font-size:11px; color: var(--muted); margin-top:6px;">Folder: ${folderName}</div>` : ''}` : ''}
+    ${foods && foods.some(f => f.mesh) ? `<div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top: 12px;"><a href="#" class="btn-primary" style="display:inline-block; text-decoration: none;" onclick="window._chatbot.downloadStlFolder(${index}); return false;">📁 Download STL Folder</a><a href="#" class="btn-primary" style="display:inline-block; text-decoration: none;" onclick="window._chatbot.downloadStlZip(${index}); return false;">📦 Download ZIP</a></div>${folderName ? `<div style="font-size:11px; color: var(--muted); margin-top:6px;">Folder: ${folderName}</div>` : ''}` : ''}
 </div>`;
             });
         } else {
@@ -1362,7 +1362,7 @@ ${plannerHTML}
     async downloadStlFolder(optionIndex) {
         try {
             if (!window.showDirectoryPicker) {
-                this.addMessage('⚠️ Your browser does not support direct folder save. Please use a Chromium browser (Chrome/Edge).', 'bot');
+                await this.downloadStlZip(optionIndex);
                 return;
             }
 
@@ -1409,6 +1409,65 @@ ${plannerHTML}
                 console.error('Folder save failed:', error);
                 this.addMessage(`❌ Failed to save STL folder: ${error?.message || 'Unknown error'}`, 'bot');
             }
+        }
+    }
+
+    async downloadStlZip(optionIndex) {
+        const rec = this._lastRecommendation || JSON.parse(sessionStorage.getItem('lastRecommendation') || 'null');
+        const result = rec?.results?.[optionIndex];
+        if (!result) {
+            this.addMessage('⚠️ No recommendation data found for this option.', 'bot');
+            return;
+        }
+
+        const [foods, , , , folderHint] = result;
+        const meshFiles = (foods || []).map(f => f.mesh).filter(Boolean);
+        if (meshFiles.length === 0) {
+            this.addMessage('⚠️ No STL files available for this option.', 'bot');
+            return;
+        }
+
+        const now = new Date();
+        const y = now.getFullYear();
+        const m = String(now.getMonth() + 1).padStart(2, '0');
+        const d = String(now.getDate()).padStart(2, '0');
+        const folderName = folderHint || `${y}${m}${d}_option${optionIndex + 1}`;
+
+        this.addMessage('📦 Preparing ZIP download for your device...', 'bot');
+
+        try {
+            const response = await fetch('/download-stl-zip', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    files: meshFiles,
+                    folder_name: folderName
+                })
+            });
+
+            if (!response.ok) {
+                let errorText = 'ZIP download failed.';
+                try {
+                    const errJson = await response.json();
+                    errorText = errJson.error || errorText;
+                } catch (_) {}
+                throw new Error(errorText);
+            }
+
+            const blob = await response.blob();
+            const downloadUrl = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = downloadUrl;
+            a.download = `${folderName}.zip`;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            window.URL.revokeObjectURL(downloadUrl);
+
+            this.addMessage(`✅ Download started: <strong>${folderName}.zip</strong>`, 'bot');
+        } catch (error) {
+            console.error('ZIP download failed:', error);
+            this.addMessage(`❌ Could not download ZIP: ${error?.message || 'Unknown error'}`, 'bot');
         }
     }
 
@@ -1597,7 +1656,7 @@ ${plannerHTML}
 
             if (entry) {
                 const n = entry.nutrition || {};
-                const kcal = Math.round((n.carbs || 0) * 4 + (n.protein || 0) * 4 + (n.fat || 0) * 9);
+                const kcal = Math.round((n.calories || 0) || ((n.carbs || 0) * 4 + (n.protein || 0) * 4 + (n.fat || 0) * 9));
                 const kcalDiv = document.createElement('div');
                 kcalDiv.className = 'cal-cell-kcal';
                 kcalDiv.textContent = `${kcal} kcal`;
@@ -1610,12 +1669,22 @@ ${plannerHTML}
                 }
                 if (pct === null) {
                     cell.classList.add('cal-cell-has-data');
-                } else if (pct >= 0.9) {
+                    cell.title = 'No target saved for this day';
+                } else if (pct >= 0.9 && pct <= 1.1) {
                     cell.classList.add('cal-cell-good');
-                } else if (pct >= 0.6) {
+                    cell.title = 'Healthy range';
+                } else if (pct >= 0.75 && pct < 0.9) {
                     cell.classList.add('cal-cell-fair');
-                } else {
+                    cell.title = 'Slightly below target';
+                } else if (pct < 0.75) {
                     cell.classList.add('cal-cell-low');
+                    cell.title = 'Too low';
+                } else if (pct > 1.1 && pct <= 1.25) {
+                    cell.classList.add('cal-cell-high');
+                    cell.title = 'Slightly above target';
+                } else {
+                    cell.classList.add('cal-cell-excess');
+                    cell.title = 'Too high';
                 }
 
                 cell.style.cursor = 'pointer';
@@ -1628,6 +1697,7 @@ ${plannerHTML}
         // Wire prev/next buttons (re-attach cleanly)
         const prevBtn = document.getElementById('cal-prev');
         const nextBtn = document.getElementById('cal-next');
+        const todayBtn = document.getElementById('cal-today');
         prevBtn.onclick = () => {
             this.calendarMonth--;
             if (this.calendarMonth < 0) { this.calendarMonth = 11; this.calendarYear--; }
@@ -1638,6 +1708,16 @@ ${plannerHTML}
             if (this.calendarMonth > 11) { this.calendarMonth = 0; this.calendarYear++; }
             this.renderCalendar();
         };
+        if (todayBtn) {
+            todayBtn.onclick = () => this.goToTodayInCalendar();
+        }
+    }
+
+    goToTodayInCalendar() {
+        const now = new Date();
+        this.calendarYear = now.getFullYear();
+        this.calendarMonth = now.getMonth();
+        this.renderCalendar();
     }
 
     showDayDetail(dateStr, entry) {
