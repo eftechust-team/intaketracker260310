@@ -18,7 +18,7 @@
 }
 
 html {
-    font-size: 32px;
+    font-size: 16px;
     height: 100%;
 }
 
@@ -254,7 +254,7 @@ input[type="submit"] {
     cursor: pointer;
     background: linear-gradient(120deg, var(--accent), var(--accent-2));
     color: #1f2937;
-    box-shadow: 0 12px 35px rgba(255, 122, 61, 0.28);
+    box-shadow: 0 4px 12px rgba(255, 122, 61, 0.16);
 }
 
 .secondary {
@@ -308,11 +308,37 @@ input[type="submit"] {
 @media (max-width: 640px) {
     header {
         flex-direction: column;
-        gap: 12px;
+        gap: 8px;
         align-items: flex-start;
+        padding: 10px 14px;
+    }
+
+    .steps {
+        gap: 6px;
+    }
+
+    .step {
+        padding: 7px 12px;
+        font-size: 13px;
     }
 
     main {
         margin-top: 16px;
+        padding: 0 14px;
+    }
+}
+
+@media (max-width: 400px) {
+    header {
+        padding: 8px 12px;
+    }
+
+    .brand-logo {
+        height: 36px;
+    }
+
+    main {
+        padding: 0 10px;
+        margin-top: 12px;
     }
 }

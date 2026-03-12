@@ -12,6 +12,9 @@ import re
 import csv
 import tempfile
 import uuid
+import struct
+import html as _html
+import xml.etree.ElementTree as ET
 from datetime import datetime
 import json as json_lib
 
@@ -138,14 +141,20 @@ def upload_to_gcs(bucket_name, source_file_name, destination_blob_name):
 # Load nutrition data from CSV file instead of USDA API
 # CSV columns: category_id, category_name, Density (g/ml), Calories (kcal/g), 
 #              Protein (g/g), Carbohydrates (g/g), Fat (g/g), Reference (FDC ID)
+CSV_NUTRITION_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "FoodSAM", "food_full_data_revised.csv"))
 csv_data = []
 csv_loaded = False
+csv_mtime = None
+
+# Simple cache to reduce repeated lookups
+_search_cache = {}
+_nutrition_cache = {}
 
 def load_nutrition_csv():
     """Load the nutrition data from CSV file into memory"""
-    global csv_data, csv_loaded
+    global csv_data, csv_loaded, csv_mtime, _search_cache, _nutrition_cache
     try:
-        csv_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "FoodSAM", "food_full_data_revised.csv"))
+        csv_path = CSV_NUTRITION_PATH
         if os.path.exists(csv_path):
             csv_data = []
             with open(csv_path, 'r', encoding='utf-8') as f:
@@ -153,6 +162,10 @@ def load_nutrition_csv():
                 for row in reader:
                     csv_data.append(row)
             csv_loaded = True
+            csv_mtime = os.path.getmtime(csv_path)
+            # Invalidate caches so lookups use refreshed CSV content.
+            _search_cache.clear()
+            _nutrition_cache.clear()
             print(f"Loaded nutrition data from CSV: {len(csv_data)} food items")
             return True
         else:
@@ -162,9 +175,18 @@ def load_nutrition_csv():
         print(f"Error loading CSV: {e}")
         return False
 
-# Simple cache to reduce repeated lookups
-_search_cache = {}
-_nutrition_cache = {}
+
+def ensure_nutrition_csv_fresh():
+    """Reload CSV if the source file changed on disk."""
+    global csv_mtime
+    try:
+        if not os.path.exists(CSV_NUTRITION_PATH):
+            return
+        current_mtime = os.path.getmtime(CSV_NUTRITION_PATH)
+        if (not csv_loaded) or (csv_mtime is None) or (current_mtime > csv_mtime):
+            load_nutrition_csv()
+    except Exception as e:
+        print(f"[WARN] Could not refresh CSV data: {e}")
 
 WORD_NUMBER_MAP = {
     'a': 1,
@@ -184,45 +206,98 @@ WORD_NUMBER_MAP = {
 }
 
 
+def _singularize(word):
+    """Convert a single English word to its approximate singular base form."""
+    if len(word) <= 2:
+        return word
+    # ies → y  (berries→berry, fries→fry, cranberries→cranberry)
+    if word.endswith('ies') and len(word) > 4:
+        return word[:-3] + 'y'
+    # Explicit sibilant-ending plurals: strip 'es'
+    # sses→ss, shes→sh, ches→ch, xes→x, zes→z  (e.g., peaches→peach, boxes→box)
+    if (word.endswith('sses') or word.endswith('shes') or
+            word.endswith('ches') or word.endswith('xes') or word.endswith('zes')):
+        return word[:-2]
+    # oes → o  (tomatoes→tomato, potatoes→potato)
+    if word.endswith('oes') and len(word) > 4:
+        return word[:-2]
+    # For other 'es' endings: if stripping just 's' leaves a word ending in 'e',
+    # that 'e' was part of the base (noodles→noodle, olives→olive, grapes→grape)
+    if word.endswith('es') and len(word) > 3:
+        stem_s = word[:-1]   # strip just 's' → keeps trailing 'e'
+        if stem_s.endswith('e'):
+            return stem_s    # noodles→noodle ✓
+        return word[:-2]     # fallback: strip 'es'
+    # Plain 's' plural (beans→bean, shoots→shoot, dumplings→dumpling, peas→pea)
+    if word.endswith('s') and len(word) > 2:
+        return word[:-1]
+    return word
+
+
 def normalize_food_name(name):
-    """Normalize food names for better CSV matching (e.g., apples -> apple)."""
+    """Normalize food names to their singular base form for better CSV matching.
+
+    Applies per-word singularization so that multi-word names work correctly,
+    e.g. 'green beans' → 'green bean', 'wonton dumplings' → 'wonton dumpling',
+    'noodles' → 'noodle', 'dried cranberries' → 'dried cranberry'.
+    """
     cleaned = (name or '').strip().lower()
     cleaned = re.sub(r'\s+', ' ', cleaned)
-    if cleaned.endswith('es') and len(cleaned) > 3:
-        cleaned = cleaned[:-2]
-    elif cleaned.endswith('s') and len(cleaned) > 2:
-        cleaned = cleaned[:-1]
-    return cleaned
+    return ' '.join(_singularize(w) for w in cleaned.split())
 
 
 def parse_direct_macro_input(text):
-    """Parse direct macro entry like '100g carb' or '+30 protein'."""
-    match = re.match(r'^([+-]?\d+(?:\.\d+)?)\s*g?\s*(carb|carbon|carbohydrate|protein|fat)s?$', text.strip(), re.IGNORECASE)
-    if not match:
+    """Parse direct nutrition input like '100g carb', '-20 fat', '1000kcal', or '-100 kcal'."""
+    cleaned = (text or '').strip()
+
+    macro_match = re.match(
+        r'^([+-]?\d+(?:\.\d+)?)\s*g?\s*(carb|carbon|carbohydrate|protein|fat)s?$',
+        cleaned,
+        re.IGNORECASE,
+    )
+    calorie_match = re.match(
+        r'^([+-]?\d+(?:\.\d+)?)\s*(kcal|cal|calorie|calories)$',
+        cleaned,
+        re.IGNORECASE,
+    )
+
+    if not macro_match and not calorie_match:
         return None
 
-    amount = float(match.group(1))
-    macro_type = match.group(2).lower()
-
     nutrition = {'carbs': 0.0, 'protein': 0.0, 'fat': 0.0, 'calories': 0.0}
-    if macro_type in ['carb', 'carbon', 'carbohydrate']:
-        nutrition['carbs'] = amount
-        macro_label = 'carbs'
-    elif macro_type == 'protein':
-        nutrition['protein'] = amount
-        macro_label = 'protein'
-    else:
-        nutrition['fat'] = amount
-        macro_label = 'fat'
 
+    if macro_match:
+        amount = float(macro_match.group(1))
+        macro_type = macro_match.group(2).lower()
+        if macro_type in ['carb', 'carbon', 'carbohydrate']:
+            nutrition['carbs'] = amount
+            macro_label = 'carbs'
+        elif macro_type == 'protein':
+            nutrition['protein'] = amount
+            macro_label = 'protein'
+        else:
+            nutrition['fat'] = amount
+            macro_label = 'fat'
+        return {
+            'food_name': f"direct {macro_label}",
+            'quantity': amount,
+            'unit': 'g',
+            'carbs': round(nutrition['carbs'], 2),
+            'protein': round(nutrition['protein'], 2),
+            'fat': round(nutrition['fat'], 2),
+            'calories': 0.0,
+        }
+
+    amount = float(calorie_match.group(1))
+    nutrition['calories'] = amount
     return {
-        'food_name': f"direct {macro_label}",
+        'food_name': 'direct calories',
         'quantity': amount,
-        'unit': 'g',
-        'carbs': round(nutrition['carbs'], 2),
-        'protein': round(nutrition['protein'], 2),
-        'fat': round(nutrition['fat'], 2),
-        'calories': 0.0
+        'unit': 'kcal',
+        'carbs': 0.0,
+        'protein': 0.0,
+        'fat': 0.0,
+        'calories': round(nutrition['calories'], 2),
     }
 
 def parse_food_input(food_input):
@@ -285,6 +360,8 @@ def search_csv_food(food_name):
     Returns a dictionary matching the expected format.
     Uses improved matching: exact > prefix > word boundary > no substring fallback.
     """
+    ensure_nutrition_csv_fresh()
+
     if not csv_loaded or not csv_data:
         print("CSV data not loaded")
         return None
@@ -358,22 +435,44 @@ def get_food_nutrition_csv(fdc_id, csv_food_row, quantity, unit):
     
     food_name = csv_food_row.get('category_name', '')
     
-    # Extract nutrition values from CSV (values are per gram)
+    # Extract nutrition values from CSV (values are per gram).
+    # The CSV uses short lowercase headers: calories, protein, carbohydrates, fat, density.
+    def _csv_float(row, *keys, default=0.0):
+        """Try each key in order and return the first non-empty float value found."""
+        for key in keys:
+            raw = str(row.get(key, '') or '').strip()
+            if raw:
+                try:
+                    return float(raw)
+                except ValueError:
+                    continue
+        return default
+
     try:
-        cal_str = str(csv_food_row.get('Calories (kcal/g)', '0') or '0').strip()
-        calories_per_gram = float(cal_str) if cal_str else 0
-        
-        prot_str = str(csv_food_row.get('Protein (g/g)', '0') or '0').strip()
-        protein_per_gram = float(prot_str) if prot_str else 0
-        
-        carbs_str = str(csv_food_row.get('Carbohydrates (g/g)', '0') or '0').strip()
-        carbs_per_gram = float(carbs_str) if carbs_str else 0
-        
-        fat_str = str(csv_food_row.get('Fat (g/g)', '0') or '0').strip()
-        fat_per_gram = float(fat_str) if fat_str else 0
-        
-        density_str = str(csv_food_row.get('Density (g/ml)', '1') or '1').strip()
-        density = float(density_str) if density_str else 1
+        calories_per_gram = _csv_float(
+            csv_food_row,
+            'calories', 'Calories', 'Calories (kcal/g)', 'calories (kcal/g)',
+        )
+        protein_per_gram = _csv_float(
+            csv_food_row,
+            'protein', 'Protein', 'Protein (g/g)', 'protein (g/g)',
+        )
+        carbs_per_gram = _csv_float(
+            csv_food_row,
+            'carbohydrates', 'Carbohydrates', 'carbs', 'Carbs',
+            'Carbohydrates (g/g)', 'carbohydrates (g/g)',
+        )
+        fat_per_gram = _csv_float(
+            csv_food_row,
+            'fat', 'Fat', 'Fat (g/g)', 'fat (g/g)',
+        )
+        density = _csv_float(
+            csv_food_row,
+            'density', 'Density', 'Density (g/ml)', 'density (g/ml)',
+            default=1.0,
+        )
+        if density == 0.0:
+            density = 1.0
     except Exception as e:
         print(f"Error parsing nutrition values: {e}")
         return None
@@ -499,7 +598,13 @@ def query_doubao_nutrition(food_name, quantity, unit):
     Returns nutrition dict or None.
     """
     try:
-        prompt = f"{quantity}{unit} {food_name} has how many carbs, protein and fat? answer in the format: carbs: xxg, protein: xxg, fat: xxg. and do not say anything else"
+        prompt = (
+            f"Estimate the nutrition for {quantity}{unit} {food_name}. "
+            "Return ONLY valid JSON with numeric values using this exact schema: "
+            '{"calories": 0, "carbs": 0, "protein": 0, "fat": 0}. '
+            "Calories must be in kcal. Carbs, protein, and fat must be in grams. "
+            "Do not include explanations, markdown, code fences, or any extra text."
+        )
         
         headers = {
             "Content-Type": "application/json",
@@ -509,7 +614,7 @@ def query_doubao_nutrition(food_name, quantity, unit):
         payload = {
             "model": DOUBAO_MODEL,
             "messages": [
-                {"role": "system", "content": "你是一个营养学家助手，专门提供食物的营养信息。"},
+                {"role": "system", "content": "你是一个营养学家助手，专门提供食物的营养信息。你必须只返回JSON，字段必须包含calories、carbs、protein、fat，全部为数字。"},
                 {"role": "user", "content": prompt}
             ]
         }
@@ -526,26 +631,87 @@ def query_doubao_nutrition(food_name, quantity, unit):
             content = message.get('content', '').strip()
             print(f"[Doubao] Response: {content}")
             
-            # Parse the response for nutrition values
-            # Expected format: "carbs: 25g, protein: 5g, fat: 1g"
             nutrition = {
                 'carbs': 0.0,
                 'protein': 0.0,
                 'fat': 0.0,
                 'calories': 0.0
             }
-            
-            # Extract values using regex
-            carbs_match = re.search(r'carbs?\s*:\s*([\d.]+)', content, re.IGNORECASE)
-            protein_match = re.search(r'protein\s*:\s*([\d.]+)', content, re.IGNORECASE)
-            fat_match = re.search(r'fat\s*:\s*([\d.]+)', content, re.IGNORECASE)
-            
-            if carbs_match:
-                nutrition['carbs'] = float(carbs_match.group(1))
-            if protein_match:
-                nutrition['protein'] = float(protein_match.group(1))
-            if fat_match:
-                nutrition['fat'] = float(fat_match.group(1))
+
+            def _coerce_number(value):
+                if value is None:
+                    return 0.0
+                if isinstance(value, (int, float)):
+                    return float(value)
+                text = str(value).strip()
+                match = re.search(r'([\d.]+)', text)
+                if match:
+                    try:
+                        return float(match.group(1))
+                    except Exception:
+                        return 0.0
+                return 0.0
+
+            def _extract_number(patterns, text):
+                for pattern in patterns:
+                    match = re.search(pattern, text, re.IGNORECASE)
+                    if match:
+                        try:
+                            return float(match.group(1))
+                        except Exception:
+                            continue
+                return 0.0
+
+            # Prefer strict JSON if Doubao follows the instruction.
+            cleaned = content.strip()
+            cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r'\s*```$', '', cleaned)
+            json_match = re.search(r'\{.*\}', cleaned, re.DOTALL)
+            if json_match:
+                try:
+                    parsed = json.loads(json_match.group(0))
+                    nutrition['calories'] = _coerce_number(
+                        parsed.get('calories', parsed.get('calorie', parsed.get('energy', parsed.get('kcal', parsed.get('热量', parsed.get('能量', 0))))))
+                    )
+                    nutrition['carbs'] = _coerce_number(
+                        parsed.get('carbs', parsed.get('carbohydrates', parsed.get('carbohydrate', parsed.get('碳水', parsed.get('碳水化合物', 0)))))
+                    )
+                    nutrition['protein'] = _coerce_number(
+                        parsed.get('protein', parsed.get('proteins', parsed.get('蛋白质', 0)))
+                    )
+                    nutrition['fat'] = _coerce_number(
+                        parsed.get('fat', parsed.get('fats', parsed.get('脂肪', 0)))
+                    )
+                except Exception:
+                    pass
+
+            # Fallback to flexible text parsing for English/Chinese/energy wording.
+            if nutrition['calories'] <= 0:
+                nutrition['calories'] = _extract_number([
+                    r'calories?[^\d]{0,12}([\d.]+)',
+                    r'energy[^\d]{0,12}([\d.]+)',
+                    r'(?:热量|能量)[^\d]{0,12}([\d.]+)',
+                    r'([\d.]+)\s*kcal',
+                ], cleaned)
+            if nutrition['carbs'] <= 0:
+                nutrition['carbs'] = _extract_number([
+                    r'carbs?[^\d]{0,12}([\d.]+)',
+                    r'carbohydrates?[^\d]{0,12}([\d.]+)',
+                    r'(?:碳水|碳水化合物)[^\d]{0,12}([\d.]+)',
+                ], cleaned)
+            if nutrition['protein'] <= 0:
+                nutrition['protein'] = _extract_number([
+                    r'protein[^\d]{0,12}([\d.]+)',
+                    r'蛋白质[^\d]{0,12}([\d.]+)',
+                ], cleaned)
+            if nutrition['fat'] <= 0:
+                nutrition['fat'] = _extract_number([
+                    r'fat[^\d]{0,12}([\d.]+)',
+                    r'脂肪[^\d]{0,12}([\d.]+)',
+                ], cleaned)
+
+            if nutrition['calories'] <= 0 and _is_nutrition_meaningful(nutrition):
+                nutrition['calories'] = nutrition['carbs'] * 4 + nutrition['protein'] * 4 + nutrition['fat'] * 9
             
             if _is_nutrition_meaningful({'carbs': nutrition['carbs'], 'protein': nutrition['protein'], 'fat': nutrition['fat']}):
                 result = {
@@ -553,7 +719,7 @@ def query_doubao_nutrition(food_name, quantity, unit):
                     'carbs': round(nutrition['carbs'], 2),
                     'protein': round(nutrition['protein'], 2),
                     'fat': round(nutrition['fat'], 2),
-                    'calories': nutrition['calories'],
+                    'calories': round(nutrition['calories'], 2),
                     'quantity': quantity,
                     'unit': unit,
                     'source': 'Doubao LLM'
@@ -636,7 +802,8 @@ def _extract_usda_nutrition_per_100g(nutrients):
         'fat': 0.0
     }
 
-    # USDA nutrientNumber reference: 1008=Energy kcal, 1003=Protein, 1005=Carbs, 1004=Fat
+    # USDA nutrientNumber reference in FoodData Central:
+    # 208=Energy (kcal), 203=Protein, 205=Carbohydrate, 204=Total lipid (fat)
     for nutrient in nutrients or []:
         nutrient_obj = nutrient.get('nutrient', {}) if isinstance(nutrient, dict) else {}
 
@@ -652,6 +819,18 @@ def _extract_usda_nutrition_per_100g(nutrients):
             or ''
         ).strip()
 
+        nutrient_id = str(
+            nutrient_obj.get('id')
+            or nutrient.get('nutrientId')
+            or ''
+        ).strip()
+
+        unit_name = str(
+            nutrient_obj.get('unitName')
+            or nutrient.get('unitName')
+            or ''
+        ).strip().lower()
+
         amount = nutrient.get('amount')
         if amount is None:
             amount = nutrient.get('value', 0)
@@ -661,13 +840,13 @@ def _extract_usda_nutrition_per_100g(nutrients):
         except Exception:
             amount = 0.0
 
-        if nutrient_number == '1008' or ('energy' in nutrient_name and 'kcal' in nutrient_name):
+        if nutrient_number == '208' or nutrient_id == '1008' or ('energy' in nutrient_name and unit_name == 'kcal'):
             nutrition_per_100g['calories'] = amount
-        elif nutrient_number == '1003' or 'protein' in nutrient_name:
+        elif nutrient_number == '203' or nutrient_id == '1003' or 'protein' in nutrient_name:
             nutrition_per_100g['protein'] = amount
-        elif nutrient_number == '1005' or ('carbohydrate' in nutrient_name and 'fiber' not in nutrient_name):
+        elif nutrient_number == '205' or nutrient_id == '1005' or ('carbohydrate' in nutrient_name and 'fiber' not in nutrient_name):
             nutrition_per_100g['carbs'] = amount
-        elif nutrient_number == '1004' or ('fat' in nutrient_name and ('total' in nutrient_name or 'lipid' in nutrient_name)):
+        elif nutrient_number == '204' or nutrient_id == '1004' or ('fat' in nutrient_name and ('total' in nutrient_name or 'lipid' in nutrient_name)):
             nutrition_per_100g['fat'] = amount
 
     return nutrition_per_100g
@@ -756,15 +935,332 @@ def get_food_nutrition_usda(fdc_id, quantity, unit):
         print(f"[USDA] Error fetching nutrition: {e}")
         return None
 
+MISSING_FOODS_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "missing_foods.txt")
+
+def _log_missing_food(food_name, quantity, unit, source, nutrition):
+    """Append a food not found in CSV to missing_foods.txt."""
+    try:
+        timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        carbs = round(float(nutrition.get('carbs', 0)), 2) if nutrition else 'N/A'
+        protein = round(float(nutrition.get('protein', 0)), 2) if nutrition else 'N/A'
+        fat = round(float(nutrition.get('fat', 0)), 2) if nutrition else 'N/A'
+        calories = round(float(nutrition.get('calories', 0)), 2) if nutrition else 'N/A'
+        line = (
+            f"[{timestamp}] food={food_name!r} | qty={quantity}{unit} | "
+            f"source={source} | carbs={carbs}g protein={protein}g fat={fat}g calories={calories}kcal\n"
+        )
+        with open(MISSING_FOODS_LOG, 'a', encoding='utf-8') as f:
+            f.write(line)
+        print(f"[MissingFoodLog] Logged: {food_name!r} (source: {source})")
+    except Exception as e:
+        print(f"[MissingFoodLog] Failed to write log: {e}")
+
+
 def get_food_nutrition_with_fallback(food_name, quantity, unit):
     """
-    Query Doubao LLM API for nutrition data.
+    Resolve nutrition for a food item using a three-tier fallback:
+      1. Local CSV database
+      2. USDA FoodData Central API
+      3. Doubao LLM
+    Foods not found in CSV are recorded in missing_foods.txt.
     Returns tuple: (nutrition_dict_or_none, source_label)
     """
+    # --- 1. CSV ---
+    csv_results = search_csv_food(food_name)
+    if csv_results and csv_results.get('foods'):
+        for food_item in csv_results['foods']:
+            csv_row = food_item.get('_csv_data')
+            if not csv_row:
+                continue
+            fdc_id = food_item.get('fdcId', '')
+            nutrition = get_food_nutrition_csv(fdc_id, csv_row, quantity, unit)
+            if nutrition and _is_nutrition_meaningful(nutrition):
+                print(f"[Fallback] Found in CSV for '{food_name}'")
+                return nutrition, "CSV"
+
+    # Not in CSV — will log regardless of where it's eventually resolved.
+
+    # --- 2. USDA API ---
+    usda_results = search_usda_food(food_name)
+    if usda_results and usda_results.get('foods'):
+        for food_item in usda_results['foods'][:5]:
+            fdc_id = food_item.get('fdcId')
+            if not fdc_id:
+                continue
+            nutrition = get_food_nutrition_usda(fdc_id, quantity, unit)
+            if nutrition and _is_nutrition_meaningful(nutrition):
+                print(f"[Fallback] Found via USDA API for '{food_name}'")
+                _log_missing_food(food_name, quantity, unit, "USDA API", nutrition)
+                return nutrition, "USDA API"
+
+    # --- 3. Doubao LLM ---
     nutrition = query_doubao_nutrition(food_name, quantity, unit)
-    if nutrition:
+    if nutrition and _is_nutrition_meaningful(nutrition):
+        print(f"[Fallback] Found via Doubao LLM for '{food_name}'")
+        _log_missing_food(food_name, quantity, unit, "Doubao LLM", nutrition)
         return nutrition, "Doubao LLM"
+
+    # Not found anywhere — still log it
+    _log_missing_food(food_name, quantity, unit, "NOT FOUND", None)
     return None, ""
+
+
+DIET_SCALE = [
+    (0.50 / 4.1, 0.20 / 4.1, 0.30 / 8.8),
+    (0.60 / 4.1, 0.20 / 4.1, 0.20 / 8.8),
+    (0.20 / 4.1, 0.30 / 4.1, 0.50 / 8.8),
+    (0.28 / 4.1, 0.39 / 4.1, 0.33 / 8.8),
+]
+
+
+def calculate_macro_targets(gender, age, height, weight, carbohydrate, protein, fat, activity, diet):
+    rmr = calculate_rmr(weight, height, age, gender)
+    calories = calculate_daily_calories(rmr, activity)
+    carbohydrate_intake, protein_intake, fat_intake = (calories * i for i in DIET_SCALE[diet])
+    carbohydrate_needed = carbohydrate_intake - carbohydrate
+    protein_needed = protein_intake - protein
+    fat_needed = fat_intake - fat
+    return {
+        'calories': round(calories, 2),
+        'carbohydrate_intake': round(carbohydrate_intake, 2),
+        'protein_intake': round(protein_intake, 2),
+        'fat_intake': round(fat_intake, 2),
+        'carbohydrate_needed': round(carbohydrate_needed, 2),
+        'protein_needed': round(protein_needed, 2),
+        'fat_needed': round(fat_needed, 2),
+        'need_vector': np.array([carbohydrate_needed, protein_needed, fat_needed], dtype=float),
+    }
+
+
+def _looks_non_veg_name(food_name_text):
+    n = (food_name_text or '').lower()
+    tags = ['chicken', 'beef', 'pork', 'fish', 'shrimp', 'mutton', 'lamb', 'meat', 'tuna', 'salmon']
+    return any(t in n for t in tags)
+
+
+def _looks_snack_or_dessert_name(food_name_text):
+    n = (food_name_text or '').lower()
+    blocked = ['candy', 'chocolate', 'cake', 'cookie', 'soda', 'syrup', 'chips', 'popcorn', 'cracker', 'biscuit', 'snack']
+    return any(t in n for t in blocked)
+
+
+def resolve_recipe_food_candidates(food_names, preference):
+    resolved = []
+    unresolved = []
+    seen = set()
+
+    for raw_name in food_names:
+        cleaned = (raw_name or '').strip()
+        if not cleaned:
+            continue
+        key = normalize_food_name(cleaned)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        nutrition, source = get_food_nutrition_with_fallback(cleaned, 100, 'g')
+        if not nutrition or not _is_nutrition_meaningful(nutrition):
+            unresolved.append(cleaned)
+            continue
+
+        resolved_name = nutrition.get('food_name') or cleaned
+        if preference and _looks_non_veg_name(resolved_name):
+            unresolved.append(cleaned)
+            continue
+
+        vec = np.array([
+            float(nutrition.get('carbs', 0) or 0) / 100.0,
+            float(nutrition.get('protein', 0) or 0) / 100.0,
+            float(nutrition.get('fat', 0) or 0) / 100.0,
+        ], dtype=float)
+        if np.sum(vec) <= 1e-8:
+            unresolved.append(cleaned)
+            continue
+
+        resolved.append({
+            'name': resolved_name,
+            'input_name': cleaned,
+            'source': source,
+            'vec': vec,
+        })
+
+    return resolved, unresolved
+
+
+def suggest_foods_for_deficit(deficit_vec, excluded_names=None, preference=0, limit=6):
+    ensure_nutrition_csv_fresh()
+
+    excluded = {normalize_food_name(x) for x in (excluded_names or [])}
+    suggestions = []
+
+    def row_float(row, *keys, default=0.0):
+        for key in keys:
+            raw = str(row.get(key, '') or '').strip()
+            if not raw:
+                continue
+            try:
+                return float(raw)
+            except Exception:
+                continue
+        return default
+
+    for row in (csv_data or []):
+        fname = (row.get('category_name') or '').strip()
+        if not fname:
+            continue
+        norm = normalize_food_name(fname)
+        if norm in excluded or norm == 'background':
+            continue
+        if preference and _looks_non_veg_name(fname):
+            continue
+        if _looks_snack_or_dessert_name(fname):
+            continue
+
+        vec = np.array([
+            row_float(row, 'carbohydrates', 'Carbohydrates', 'carbs', 'Carbs', default=0.0),
+            row_float(row, 'protein', 'Protein', default=0.0),
+            row_float(row, 'fat', 'Fat', default=0.0),
+        ], dtype=float)
+        if np.sum(vec) <= 1e-8:
+            continue
+
+        score = float(np.dot(vec * 100.0, np.maximum(deficit_vec, 0.0)))
+        if score > 0:
+            suggestions.append((score, fname))
+
+    suggestions.sort(key=lambda x: x[0], reverse=True)
+    result = []
+    seen = set()
+    for _, fname in suggestions:
+        norm = normalize_food_name(fname)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        result.append(fname)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def build_recipe_option(title, candidates, target_need, use_all_requested=False):
+    if not candidates:
+        return None
+
+    positive_target = np.maximum(target_need, 0.0)
+    nutr = np.array([c['vec'] for c in candidates], dtype=float)
+    count = len(candidates)
+    min_grams = np.array([15.0 if use_all_requested else 0.0] * count, dtype=float)
+    max_grams = np.array([350.0] * count, dtype=float)
+    x0 = np.array([max(60.0, min_grams[i]) for i in range(count)], dtype=float)
+
+    def objective(extra_amounts):
+        grams = min_grams + np.maximum(extra_amounts, 0.0)
+        supplied = np.dot(grams, nutr)
+        under = np.maximum(positive_target - supplied, 0.0)
+        over = np.maximum(supplied - positive_target, 0.0)
+        return float(np.sum(under ** 2) + 4.0 * np.sum(over ** 2) + 0.0008 * np.sum(grams))
+
+    try:
+        res = minimize(
+            objective,
+            np.maximum(x0 - min_grams, 0.0),
+            method='L-BFGS-B',
+            bounds=[(0.0, max_grams[i] - min_grams[i]) for i in range(count)]
+        )
+        extra = res.x if res.success else np.maximum(x0 - min_grams, 0.0)
+    except Exception:
+        extra = np.maximum(x0 - min_grams, 0.0)
+
+    grams = np.clip(min_grams + np.maximum(extra, 0.0), min_grams, max_grams)
+    supplied = np.dot(grams, nutr)
+    under = np.maximum(positive_target - supplied, 0.0)
+    over = np.maximum(supplied - positive_target, 0.0)
+
+    foods = []
+    for idx, candidate in enumerate(candidates):
+        gram = round(float(grams[idx]), 2)
+        if gram <= 0:
+            continue
+        foods.append({
+            'name': candidate['name'],
+            'gram': gram,
+            'source': candidate.get('source', ''),
+        })
+
+    if not foods:
+        return None
+
+    return {
+        'title': title,
+        'uses_all_requested': use_all_requested,
+        'foods': foods,
+        'supplied': {
+            'carbs': round(float(supplied[0]), 2),
+            'protein': round(float(supplied[1]), 2),
+            'fat': round(float(supplied[2]), 2),
+        },
+        'shortfall_total': round(float(np.sum(under)), 2),
+        'exceed_total': round(float(np.sum(over)), 2),
+        'score': round(float(np.sum(under) + 2.5 * np.sum(over)), 3),
+    }
+
+
+def build_custom_recipe_recommendations(food_text, target_need, preference, limit=4):
+    requested_foods = [item.strip() for item in re.split(r'[,，;]+', str(food_text or '')) if item.strip()]
+    requested_foods = requested_foods[:6]
+    resolved, unresolved = resolve_recipe_food_candidates(requested_foods, preference)
+
+    recipes = []
+    if resolved:
+        recipe1 = build_recipe_option('Recipe 1', resolved, target_need, use_all_requested=True)
+        if recipe1:
+            recipes.append(recipe1)
+
+        subset_candidates = []
+        for subset_size in range(1, len(resolved)):
+            for idx_tuple in combinations(range(len(resolved)), subset_size):
+                chosen = [resolved[i] for i in idx_tuple]
+                recipe = build_recipe_option('', chosen, target_need, use_all_requested=False)
+                if recipe:
+                    subset_candidates.append(recipe)
+
+        subset_candidates.sort(key=lambda r: (r['score'], r['exceed_total'], r['shortfall_total']))
+        seen = set()
+        for recipe in subset_candidates:
+            key = tuple(sorted(f['name'] for f in recipe['foods']))
+            if key in seen:
+                continue
+            seen.add(key)
+            recipe['title'] = f"Recipe {len(recipes) + 1}"
+            recipes.append(recipe)
+            if len(recipes) >= limit:
+                break
+
+    advice = {'message': '', 'suggested_foods': [], 'unresolved_foods': unresolved}
+    if unresolved:
+        advice['message'] = 'Some requested foods could not be resolved from CSV/USDA/Doubao.'
+
+    if recipes:
+        deficit = np.maximum(target_need - np.array([
+            float(recipes[0]['supplied']['carbs']),
+            float(recipes[0]['supplied']['protein']),
+            float(recipes[0]['supplied']['fat']),
+        ]), 0.0)
+        if np.sum(deficit) > 12.0 or unresolved:
+            advice['suggested_foods'] = suggest_foods_for_deficit(deficit, [f['name'] for f in resolved], preference, limit=6)
+            if advice['suggested_foods'] and not advice['message']:
+                advice['message'] = 'Your requested foods alone may not fully meet the supplementary nutrition.'
+    elif requested_foods:
+        advice['message'] = 'Could not build recipes from the requested foods.'
+        advice['suggested_foods'] = suggest_foods_for_deficit(target_need, [], preference, limit=6)
+
+    return {
+        'requested_foods': requested_foods,
+        'resolved_foods': [r['name'] for r in resolved],
+        'unresolved_foods': unresolved,
+        'recipes': recipes,
+        'advice': advice,
+    }
 
 # Load CSV data on app startup
 with app.app_context():
@@ -932,19 +1428,142 @@ def mesh_generation(name, weight, density, z_offset=0.0): #g/cm3, z_offset in mm
 
     return x, y, z
 
-def recommend(gender, age, height, weight, carbohydrate, protein, fat, activity, diet, preference):
-    rmr = calculate_rmr(weight, height, age, gender)
-    calories = calculate_daily_calories(rmr, activity)
-    diet_scale = [(0.50 / 4.1, 0.20 / 4.1, 0.30 / 8.8), # balanced
-              (0.60 / 4.1, 0.20 / 4.1, 0.20 / 8.8), # low fat
-              (0.20 / 4.1, 0.30 / 4.1, 0.50 / 8.8), # low carbs,
-              (0.28 / 4.1, 0.39 / 4.1, 0.33 / 8.8)] # high protein
 
-    carbohydrate_intake, protein_intake, fat_intake = (calories * i for i in diet_scale[diet])
+def _stl_to_triangles(stl_path):
+    """Read a binary STL and return list of (v0,v1,v2) triangle tuples (mm)."""
+    triangles = []
+    try:
+        with open(stl_path, 'rb') as f:
+            f.read(80)  # header
+            count = struct.unpack('<I', f.read(4))[0]
+            for _ in range(count):
+                f.read(12)  # normal
+                v0 = struct.unpack('<fff', f.read(12))
+                v1 = struct.unpack('<fff', f.read(12))
+                v2 = struct.unpack('<fff', f.read(12))
+                f.read(2)  # attr
+                triangles.append((v0, v1, v2))
+    except Exception as e:
+        print(f'[WARN] _stl_to_triangles failed for {stl_path}: {e}')
+    return triangles
 
-    carbohydrate_needed = carbohydrate_intake - carbohydrate
-    protein_needed = protein_intake - protein
-    fat_needed = fat_intake - fat
+
+def create_obj_bundle(stl_paths_and_names, output_obj_path):
+    """
+    Bundle multiple STL files into a single Wavefront OBJ file.
+    stl_paths_and_names: list of (stl_file_path, object_name) tuples.
+    Each STL becomes a named 'o' group; vertex indices are global and
+    1-based as required by the OBJ spec.
+    OBJ is plain text, requires no packaging, and is universally
+    supported by all major slicers (PrusaSlicer, Cura, Bambu Studio,
+    Blender, etc.).
+    """
+    lines = ['# ElevateFoods AI Nutrition Chatbot – multi-part food mesh\n']
+    vertex_offset = 0
+    obj_count = 0
+
+    for stl_path, obj_name in stl_paths_and_names:
+        triangles = _stl_to_triangles(stl_path)
+        if not triangles:
+            continue
+
+        # Deduplicate vertices, round to 4 dp
+        vert_map = {}
+        verts = []
+        tri_indices = []
+        for v0, v1, v2 in triangles:
+            idxs = []
+            for v in (v0, v1, v2):
+                key = (round(v[0], 4), round(v[1], 4), round(v[2], 4))
+                if key not in vert_map:
+                    vert_map[key] = len(verts)
+                    verts.append(key)
+                idxs.append(vert_map[key])
+            tri_indices.append(idxs)
+
+        # OBJ object name: replace whitespace/special chars with underscore
+        safe_name = re.sub(r'[^a-zA-Z0-9_-]', '_', obj_name)
+        lines.append(f'o {safe_name}\n')
+        for v in verts:
+            lines.append(f'v {v[0]:.4f} {v[1]:.4f} {v[2]:.4f}\n')
+        for idxs in tri_indices:
+            # OBJ faces are 1-based and globally indexed
+            lines.append(f'f {idxs[0]+vertex_offset+1} {idxs[1]+vertex_offset+1} {idxs[2]+vertex_offset+1}\n')
+
+        vertex_offset += len(verts)
+        obj_count += 1
+
+    if obj_count == 0:
+        print(f'[WARN] create_obj_bundle: no valid meshes, skipping {output_obj_path}')
+        return
+
+    with open(output_obj_path, 'w', encoding='utf-8') as f:
+        f.writelines(lines)
+    print(f'[INFO] Created OBJ bundle: {output_obj_path} ({obj_count} objects)')
+
+
+def create_obj_from_items(items, output_obj_path):
+    """
+    Write a Wavefront OBJ file directly from box dimension data — no temp STL files needed.
+    items: list of dicts with keys: name, x, y, z, z_offset (all in mm).
+    Each item becomes a named 'o' group = rectangular box (8 verts, 12 triangular faces).
+    Works regardless of MESH_STORAGE mode.
+    """
+    lines = ['# ElevateFoods AI Nutrition Chatbot – multi-part food mesh\n']
+    vertex_offset = 0
+    obj_count = 0
+
+    for item in items:
+        iname  = item['name']
+        ix     = float(item['x'])         # width mm
+        iy     = float(item['y'])         # depth mm
+        iz     = float(item['z'])         # height mm
+        z0     = float(item.get('z_offset', 0.0))
+        z1     = z0 + iz
+        hx, hy = ix / 2.0, iy / 2.0
+
+        verts = [
+            (-hx, -hy, z0), ( hx, -hy, z0), ( hx,  hy, z0), (-hx,  hy, z0),
+            (-hx, -hy, z1), ( hx, -hy, z1), ( hx,  hy, z1), (-hx,  hy, z1),
+        ]
+        faces = [
+            (0,3,1),(1,3,2),  # bottom
+            (4,5,6),(4,6,7),  # top
+            (0,4,7),(0,7,3),  # left
+            (5,1,2),(5,2,6),  # right
+            (0,1,5),(0,5,4),  # front
+            (2,3,7),(2,7,6),  # back
+        ]
+
+        safe_name = re.sub(r'[^a-zA-Z0-9_-]', '_', iname)
+        lines.append(f'o {safe_name}\n')
+        for v in verts:
+            lines.append(f'v {v[0]:.4f} {v[1]:.4f} {v[2]:.4f}\n')
+        for fi in faces:
+            lines.append(f'f {fi[0]+vertex_offset+1} {fi[1]+vertex_offset+1} {fi[2]+vertex_offset+1}\n')
+        vertex_offset += len(verts)
+        obj_count += 1
+
+    if obj_count == 0:
+        print(f'[WARN] create_obj_from_items: no items, skipping {output_obj_path}')
+        return
+
+    with open(output_obj_path, 'w', encoding='utf-8') as f:
+        f.writelines(lines)
+    print(f'[INFO] Written {obj_count} objects to {output_obj_path}')
+
+
+def recommend(gender, age, height, weight, carbohydrate, protein, fat, activity, diet, preference, preferred_foods=''):
+    ensure_nutrition_csv_fresh()
+
+    targets = calculate_macro_targets(gender, age, height, weight, carbohydrate, protein, fat, activity, diet)
+    calories = targets['calories']
+    carbohydrate_intake = targets['carbohydrate_intake']
+    protein_intake = targets['protein_intake']
+    fat_intake = targets['fat_intake']
+    carbohydrate_needed = targets['carbohydrate_needed']
+    protein_needed = targets['protein_needed']
+    fat_needed = targets['fat_needed']
 
     # Each row is [carbohydrates, proteins, fats]
     W_per_hundred = np.array([
@@ -963,6 +1582,306 @@ def recommend(gender, age, height, weight, carbohydrate, protein, fat, activity,
     else: blocked = 1
 
     y = np.array([carbohydrate_needed, protein_needed, fat_needed]) # [carbohydrates, proteins, fats]
+
+    def _compute_best_matches(target_need, top_k=4, preferred_foods_text=''):
+        """Build 3-4 nutrition-first options from CSV foods (fallback to model foods if needed)."""
+        positive_target = np.maximum(target_need, 0.0)
+        if np.all(positive_target <= 1e-6):
+            return [], {'insufficient': False, 'suggested_foods': []}
+
+        preferred_terms = [
+            normalize_food_name(t.strip()) for t in str(preferred_foods_text or '').split(',') if t.strip()
+        ]
+
+        def _row_float(row, *keys, default=0.0):
+            for key in keys:
+                raw = str(row.get(key, '') or '').strip()
+                if not raw:
+                    continue
+                try:
+                    return float(raw)
+                except Exception:
+                    continue
+            return default
+
+        def _looks_non_veg(food_name_text):
+            n = (food_name_text or '').lower()
+            tags = ['chicken', 'beef', 'pork', 'fish', 'shrimp', 'mutton', 'lamb', 'meat', 'tuna', 'salmon']
+            return any(t in n for t in tags)
+
+        def _food_tags(food_name_text, vec):
+            """Heuristic tags for dish composition quality."""
+            n = (food_name_text or '').lower()
+            carbs_pg, protein_pg, fat_pg = float(vec[0]), float(vec[1]), float(vec[2])
+
+            tags = set()
+            if carbs_pg >= max(protein_pg, fat_pg) and carbs_pg > 0.06:
+                tags.add('base')
+            if protein_pg >= max(carbs_pg, fat_pg) and protein_pg > 0.06:
+                tags.add('protein')
+            if fat_pg >= max(carbs_pg, protein_pg) and fat_pg > 0.05:
+                tags.add('fat')
+
+            veggie_keys = ['broccoli', 'spinach', 'cabbage', 'pepper', 'carrot', 'onion', 'tomato', 'mushroom', 'zucchini', 'lettuce', 'bean', 'pea', 'corn', 'eggplant', 'cauliflower']
+            if any(k in n for k in veggie_keys):
+                tags.add('veg')
+
+            starch_keys = ['rice', 'noodle', 'pasta', 'potato', 'sweet potato', 'quinoa', 'oat', 'bread']
+            if any(k in n for k in starch_keys):
+                tags.add('base')
+
+            protein_keys = ['chicken', 'beef', 'pork', 'fish', 'shrimp', 'tofu', 'egg', 'lentil', 'bean', 'turkey']
+            if any(k in n for k in protein_keys):
+                tags.add('protein')
+
+            sauce_fat_keys = ['olive', 'avocado', 'sesame', 'cheese', 'nuts', 'peanut']
+            if any(k in n for k in sauce_fat_keys):
+                tags.add('fat')
+
+            sweet_keys = ['candy', 'chocolate', 'cake', 'cookie', 'soda', 'syrup']
+            if any(k in n for k in sweet_keys):
+                tags.add('dessert')
+
+            snack_keys = ['chips', 'popcorn', 'cracker', 'biscuit', 'snack']
+            if any(k in n for k in snack_keys):
+                tags.add('snack')
+
+            return tags
+
+        def _dish_quality(chosen_items):
+            """Score whether selected foods can form one savory dish."""
+            union_tags = set()
+            names = []
+            for it in chosen_items:
+                union_tags.update(it.get('tags', set()))
+                names.append(it.get('name', ''))
+
+            score = 0.0
+            if 'base' in union_tags:
+                score += 1.2
+            if 'protein' in union_tags:
+                score += 1.6
+            if 'veg' in union_tags:
+                score += 1.0
+            if 'fat' in union_tags:
+                score += 0.6
+            if {'base', 'protein', 'veg'}.issubset(union_tags):
+                score += 2.0
+            if 'dessert' in union_tags:
+                score -= 2.5
+
+            name_blob = ' '.join(n.lower() for n in names)
+            if ('rice' in name_blob and ('chicken' in name_blob or 'tofu' in name_blob or 'egg' in name_blob)):
+                score += 0.8
+            if ('noodle' in name_blob and ('beef' in name_blob or 'chicken' in name_blob or 'tofu' in name_blob)):
+                score += 0.8
+            if ('potato' in name_blob and ('chicken' in name_blob or 'bean' in name_blob or 'lentil' in name_blob)):
+                score += 0.6
+
+            # Build short human-readable dish hint
+            if {'base', 'protein', 'veg'}.issubset(union_tags):
+                hint = 'Balanced one-bowl meal'
+            elif {'protein', 'veg'}.issubset(union_tags):
+                hint = 'Savory protein + veggie plate'
+            elif {'base', 'protein'}.issubset(union_tags):
+                hint = 'Hearty base + protein dish'
+            else:
+                hint = 'Simple mixed dish'
+
+            return score, hint
+
+        def _pool_from_csv():
+            pool = []
+            for row in (csv_data or []):
+                fname = (row.get('category_name') or '').strip()
+                if not fname:
+                    continue
+                lower_name = fname.lower()
+                if normalize_food_name(fname) == 'background':
+                    continue
+                if preference and _looks_non_veg(fname):
+                    continue
+                if any(nk in lower_name for nk in ['almond', 'walnut', 'cashew', 'pecan', 'hazelnut', 'pistachio']):
+                    continue
+
+                carbs_pg = _row_float(row, 'carbohydrates', 'Carbohydrates', 'carbs', 'Carbs', default=0.0)
+                protein_pg = _row_float(row, 'protein', 'Protein', default=0.0)
+                fat_pg = _row_float(row, 'fat', 'Fat', default=0.0)
+                vec = np.array([carbs_pg, protein_pg, fat_pg], dtype=float)
+                if np.sum(vec) <= 1e-8:
+                    continue
+                tags = _food_tags(fname, vec)
+                if 'dessert' in tags or 'snack' in tags:
+                    continue
+                if not ({'base', 'protein', 'veg', 'fat'} & tags):
+                    continue
+                norm_name = normalize_food_name(fname)
+                pool.append({'name': fname, 'vec': vec, 'tags': tags, 'normalized': norm_name})
+            return pool
+
+        def _pool_from_model_foods():
+            p = []
+            for i in range(len(name)):
+                if i == blocked:
+                    continue
+                p.append({'name': name[i], 'vec': W[i], 'tags': _food_tags(name[i], W[i])})
+            return p
+
+        def _is_preferred(item):
+            if not preferred_terms:
+                return True
+            n = item.get('normalized') or normalize_food_name(item.get('name', ''))
+            n = n.replace('_', ' ')
+            for t in preferred_terms:
+                if not t:
+                    continue
+                tt = t.replace('_', ' ')
+                if n == tt or tt in n or n in tt:
+                    return True
+            return False
+
+        def _select_shortlist(pool, k=18):
+            scored = []
+            for item in pool:
+                probe = item['vec'] * 150.0  # 150g probe serving
+                under = np.maximum(positive_target - probe, 0.0)
+                over = np.maximum(probe - positive_target, 0.0)
+                score = float(np.sum(under) + 3.0 * np.sum(over))
+                scored.append((score, item))
+            scored.sort(key=lambda x: x[0])
+            return [item for _, item in scored[:k]]
+
+        full_pool = _pool_from_csv()
+        preferred_pool = [it for it in full_pool if _is_preferred(it)] if preferred_terms else full_pool
+        using_preferred = bool(preferred_terms) and len(preferred_pool) >= 2
+
+        pool = preferred_pool if len(preferred_pool) >= 2 else full_pool
+        if len(pool) < 6:
+            pool = _pool_from_model_foods()
+            using_preferred = False
+
+        shortlist = _select_shortlist(pool, k=18 if len(pool) > 18 else len(pool))
+        if len(shortlist) < 2:
+            return [], {
+                'insufficient': bool(preferred_terms),
+                'used_preferred': using_preferred,
+                'preferred_foods': preferred_terms,
+                'reason': 'Not enough preferred foods found in CSV to form combinations.',
+                'suggested_foods': [it['name'] for it in _select_shortlist(full_pool, k=5)] if full_pool else [],
+            }
+
+        candidates = []
+        combo_sizes = [2, 3] if len(shortlist) >= 3 else [2]
+        for csize in combo_sizes:
+            for idx_tuple in combinations(range(len(shortlist)), csize):
+                chosen = [shortlist[i] for i in idx_tuple]
+                nutr = np.array([it['vec'] for it in chosen], dtype=float)  # per-gram macros
+                try:
+                    grams, _ = nnls(nutr.T, positive_target)
+                except Exception:
+                    continue
+
+                grams = np.clip(grams, 0.0, 350.0)
+                if np.sum(grams >= 1.0) < 2:
+                    continue
+
+                supplied = np.dot(grams, nutr)
+                under = np.maximum(positive_target - supplied, 0.0)
+                over = np.maximum(supplied - positive_target, 0.0)
+                dish_bonus, dish_hint = _dish_quality(chosen)
+                if dish_bonus < 1.4:
+                    continue
+                score = float(np.sum(under) + 3.0 * np.sum(over) + 0.001 * np.sum(grams) - 0.7 * dish_bonus)
+
+                foods = []
+                for j, it in enumerate(chosen):
+                    g = round(float(grams[j]), 2)
+                    if g >= 1.0:
+                        foods.append({'name': it['name'], 'gram': g})
+                if len(foods) < 2:
+                    continue
+
+                candidates.append({
+                    'foods': foods,
+                    'dish_hint': dish_hint,
+                    'supplied': {
+                        'carbs': round(float(supplied[0]), 2),
+                        'protein': round(float(supplied[1]), 2),
+                        'fat': round(float(supplied[2]), 2),
+                    },
+                    'shortfall_total': round(float(np.sum(under)), 2),
+                    'exceed_total': round(float(np.sum(over)), 2),
+                    'dish_score': round(float(dish_bonus), 3),
+                    'score': round(score, 3),
+                })
+
+        candidates.sort(key=lambda c: (c['score'], c['exceed_total'], c['shortfall_total'], -c.get('dish_score', 0.0)))
+
+        selected = []
+        seen_keys = set()
+        for c in candidates:
+            key = tuple(sorted(f['name'] for f in c['foods']))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            selected.append(c)
+            if len(selected) >= top_k:
+                break
+
+        if len(selected) < min(3, top_k):
+            for c in candidates:
+                if c in selected:
+                    continue
+                selected.append(c)
+                if len(selected) >= top_k:
+                    break
+
+        selected = selected[:top_k]
+
+        advice = {
+            'insufficient': False,
+            'used_preferred': using_preferred,
+            'preferred_foods': preferred_terms,
+            'suggested_foods': []
+        }
+
+        if preferred_terms and not using_preferred:
+            advice['insufficient'] = True
+            advice['reason'] = 'Preferred foods were not enough to build complete combinations.'
+            advice['suggested_foods'] = [it['name'] for it in _select_shortlist(full_pool, k=6)] if full_pool else []
+            return selected, advice
+
+        if using_preferred:
+            best_gap = selected[0]['shortfall_total'] if selected else float(np.sum(positive_target))
+            if (not selected) or best_gap > 18.0:
+                advice['insufficient'] = True
+                advice['reason'] = 'Preferred foods alone cannot closely meet required nutrition.'
+
+                deficit = positive_target.copy()
+                if selected:
+                    s0 = selected[0].get('supplied', {})
+                    deficit = np.maximum(
+                        positive_target - np.array([
+                            float(s0.get('carbs', 0) or 0),
+                            float(s0.get('protein', 0) or 0),
+                            float(s0.get('fat', 0) or 0),
+                        ]),
+                        0.0
+                    )
+
+                extra_pool = [it for it in full_pool if not _is_preferred(it)]
+                scored_extra = []
+                for it in extra_pool:
+                    probe = it['vec'] * 100.0
+                    fit = float(np.dot(probe, deficit))
+                    if fit > 0:
+                        scored_extra.append((fit, it['name']))
+                scored_extra.sort(key=lambda x: x[0], reverse=True)
+                advice['suggested_foods'] = [n for _, n in scored_extra[:6]]
+
+        return selected, advice
+
+    best_matches, best_match_advice = _compute_best_matches(y, top_k=4, preferred_foods_text=preferred_foods)
 
     # positive_indices = np.where(y > 0)[0]
     # positive_y = y[positive_indices]
@@ -1052,9 +1971,16 @@ def recommend(gender, age, height, weight, carbohydrate, protein, fat, activity,
             # Show download links when meshes are allowed; on-demand regen will be used if file is missing
             mesh_field = mesh_name if MESH_MODE != 'none' and x and y and z else ''
             if x and y and z:
+                material_mesh_list.append({'name': name[indices[i]], 'mesh': mesh_field, 'gram': amounts[i],
+                                           'x': round(x, 2), 'y': round(y, 2), 'z': round(z, 2),
+                                           'z_offset': round(z_off, 4)})
                 cumulative_z += z  # advance the stack by this item's thickness
-                material_mesh_list.append({'name': name[indices[i]], 'mesh': mesh_field, 'gram': amounts[i], 'x': round(x, 2), 'y': round(y, 2), 'z': round(z, 2)})
-        results.append((material_mesh_list, round(carbohydrate_supplement, 2), round(protein_supplement, 2), round(fat_supplement, 2)))            
+        # Folder name hint for client-side direct folder save (no ZIP packaging).
+        folder_name = ''
+        if MESH_MODE != 'none' and material_mesh_list:
+            folder_name = f"{datetime.now().strftime('%Y%m%d')}_option{index + 1}"
+
+        results.append((material_mesh_list, round(carbohydrate_supplement, 2), round(protein_supplement, 2), round(fat_supplement, 2), folder_name))
 
     # print(results)
 
@@ -1065,6 +1991,8 @@ def recommend(gender, age, height, weight, carbohydrate, protein, fat, activity,
                       'carbohydrate_needed': round(carbohydrate_needed, 2),
                       'protein_needed': round(protein_needed, 2),
                       'fat_needed': round(fat_needed, 2),
+                                            'best_matches': best_matches,
+                                            'best_match_advice': best_match_advice,
                     #   'carbohydrate_supplement': round(carbohydrate_needed, 2),
                     #   'protein_supplement': round(protein_needed, 2),
                     #   'fat_supplement': round(fat_needed, 2),
@@ -1342,6 +2270,7 @@ def api_calculate_recommendation():
         activity = to_int(user_info.get('activity'), 0)
         diet = to_int(user_info.get('diet'), 0)
         preference = to_int(user_info.get('preference'), 0)
+        preferred_foods = str(user_info.get('preferred_foods', '') or '').strip()
 
         # Minimal validation with soft defaults
         missing = []
@@ -1377,7 +2306,7 @@ def api_calculate_recommendation():
         
         # Call existing recommendation function with a robust fallback
         try:
-            recommend_dict = recommend(gender, age, height, weight, carbs, protein, fat, activity, diet, preference)
+            recommend_dict = recommend(gender, age, height, weight, carbs, protein, fat, activity, diet, preference, preferred_foods)
         except Exception as rec_err:
             # Fallback: compute targets and needs without optimization/meshes
             try:
@@ -1398,6 +2327,8 @@ def api_calculate_recommendation():
                     'carbohydrate_needed': round(carbohydrate_intake - carbs, 2),
                     'protein_needed': round(protein_intake - protein, 2),
                     'fat_needed': round(fat_intake - fat, 2),
+                    'best_matches': [],
+                    'best_match_advice': {'insufficient': False, 'suggested_foods': []},
                     'results': []
                 }
                 note = 'Generated minimal recommendation (optimization failed)'
@@ -1442,6 +2373,63 @@ def api_calculate_recommendation():
         if DIAG_MODE:
             return jsonify({'error': str(e)}), 500
         return jsonify({'error': 'Recommendation failed. Please try again later.'}), 500
+
+
+@app.route('/api/calculate-custom-recipes', methods=['POST'])
+def api_calculate_custom_recipes():
+    """Calculate Recipe 1-4 from user-entered desired foods."""
+    try:
+        data = request.json or {}
+        user_info = data.get('user_info', {})
+        daily_nutrition = data.get('daily_nutrition', {})
+        food_text = str(data.get('food_text', '') or '').strip()
+
+        if not food_text:
+            return jsonify({'error': 'Please enter foods like "chicken breast, broccoli, noodles".'}), 400
+
+        def to_int(val, default=0):
+            try:
+                if val is None or val == '':
+                    return default
+                return int(val)
+            except Exception:
+                return default
+
+        def to_float(val, default=0.0):
+            try:
+                if val is None or val == '':
+                    return default
+                return float(val)
+            except Exception:
+                return default
+
+        gender = to_int(user_info.get('gender'), 0)
+        age = to_int(user_info.get('age'), 25)
+        height = to_float(user_info.get('height'), 170.0)
+        weight = to_float(user_info.get('weight'), 70.0)
+        carbs = to_float(daily_nutrition.get('carbs'), 0)
+        protein = to_float(daily_nutrition.get('protein'), 0)
+        fat = to_float(daily_nutrition.get('fat'), 0)
+        activity = to_int(user_info.get('activity'), 2)
+        diet = to_int(user_info.get('diet'), 0)
+        preference = to_int(user_info.get('preference'), 0)
+
+        targets = calculate_macro_targets(gender, age, height, weight, carbs, protein, fat, activity, diet)
+        recipe_data = build_custom_recipe_recommendations(food_text, targets['need_vector'], preference, limit=4)
+
+        return jsonify({
+            'success': True,
+            'recipes': recipe_data['recipes'],
+            'requested_foods': recipe_data['requested_foods'],
+            'resolved_foods': recipe_data['resolved_foods'],
+            'unresolved_foods': recipe_data['unresolved_foods'],
+            'advice': recipe_data['advice'],
+        }), 200
+    except Exception as e:
+        print(f"Error in api_calculate_custom_recipes: {e}")
+        if DIAG_MODE:
+            return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'Custom recipe calculation failed.'}), 500
 
 @app.route('/api/user-records', methods=['GET', 'POST'])
 def api_user_records():
@@ -1516,6 +2504,28 @@ def api_user_record_detail(user_id):
         if DIAG_MODE:
             return jsonify({'error': str(e)}), 500
         return jsonify({'error': 'Unable to fetch user record.'}), 500
+
+@app.route('/download-obj/<path:filename>', methods=['GET'])
+def download_obj(filename):
+    """Download a pre-built .obj bundle from local temp storage."""
+    try:
+        temp_dir = tempfile.gettempdir()
+        local_path = os.path.join(temp_dir, filename)
+        if not os.path.exists(local_path):
+            return jsonify({'error': f'OBJ file not found: {filename}'}), 404
+        with open(local_path, 'rb') as f:
+            file_data = io.BytesIO(f.read())
+        file_data.seek(0)
+        return send_file(
+            file_data,
+            mimetype='model/obj',
+            as_attachment=True,
+            download_name=filename
+        )
+    except Exception as e:
+        print(f'[ERROR] Error downloading OBJ: {e}')
+        return jsonify({'error': str(e)}), 404
+
 
 @app.route('/download-stl/<path:filename>', methods=['GET'])
 def download_stl(filename):

@@ -1,0 +1,18 @@
+[2026-03-12 02:15:02 UTC] food='chicken breast' | qty=100.0g | source=USDA API | carbs=1.06g protein=20.42g fat=4.58g calories=0.0kcal
+[2026-03-12 02:39:11 UTC] food='hamburger' | qty=1.0unit | source=USDA API | carbs=69.77g protein=13.95g fat=0.0g calories=0.0kcal
+[2026-03-12 05:44:11 UTC] food='noodle' | qty=100.0g | source=USDA API | carbs=19.0g protein=3.2g fat=5.3g calories=0.0kcal
+[2026-03-12 06:08:13 UTC] food='brocoli' | qty=100.0g | source=USDA API | carbs=27.27g protein=27.27g fat=0.0g calories=0.0kcal
+[2026-03-12 06:08:48 UTC] food='brocoli' | qty=100.0g | source=USDA API | carbs=27.27g protein=27.27g fat=0.0g calories=0.0kcal
+[2026-03-12 07:20:23 UTC] food='1000kcal' | qty=1.0unit | source=Doubao LLM | carbs=125.0g protein=50.0g fat=33.33g calories=0.0kcal
+[2026-03-12 07:58:27 UTC] food='cookie' | qty=100g | source=USDA API | carbs=47.83g protein=21.74g fat=17.39g calories=0.0kcal
+[2026-03-12 08:00:11 UTC] food='cookie' | qty=1.0unit | source=USDA API | carbs=71.75g protein=32.61g fat=26.09g calories=0.0kcal
+[2026-03-12 08:01:59 UTC] food='cookie' | qty=1.0unit | source=USDA API | carbs=71.75g protein=32.61g fat=26.09g calories=0.0kcal
+[2026-03-12 08:05:58 UTC] food='cookie' | qty=1.0unit | source=USDA API | carbs=71.75g protein=32.61g fat=26.09g calories=0.0kcal
+[2026-03-12 08:06:07 UTC] food='cookie' | qty=100.0g | source=USDA API | carbs=47.83g protein=21.74g fat=17.39g calories=0.0kcal
+[2026-03-12 08:08:35 UTC] food='cookie' | qty=100.0g | source=USDA API | carbs=47.83g protein=21.74g fat=17.39g calories=0.0kcal
+[2026-03-12 08:09:59 UTC] food='unit banana' | qty=1.0unit | source=USDA API | carbs=132.42g protein=5.83g fat=0.51g calories=0.0kcal
+[2026-03-12 08:11:03 UTC] food='unit banana' | qty=1.0unit | source=USDA API | carbs=132.42g protein=5.83g fat=0.51g calories=519.0kcal
+[2026-03-12 08:12:13 UTC] food='bak choi' | qty=100.0g | source=USDA API | carbs=3.51g protein=1.02g fat=0.23g calories=17.0kcal
+[2026-03-12 08:12:58 UTC] food='bak choi' | qty=100g | source=USDA API | carbs=3.51g protein=1.02g fat=0.23g calories=17.0kcal
+[2026-03-12 08:13:48 UTC] food='bak choi' | qty=100g | source=USDA API | carbs=3.51g protein=1.02g fat=0.23g calories=17.0kcal
+[2026-03-12 08:15:35 UTC] food='bak choy' | qty=100.0g | source=USDA API | carbs=3.51g protein=1.02g fat=0.23g calories=17.0kcal

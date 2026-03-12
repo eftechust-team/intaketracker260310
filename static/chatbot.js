@@ -8,11 +8,13 @@ class NutritionChatbot {
         this.dailyNutrition = {
             carbs: 0,
             protein: 0,
-            fat: 0
+            fat: 0,
+            calories: 0
         };
         this.userInfo = {};
         this.userRecordId = null;
         this.conversationHistory = [];
+        this._recipePlanners = {};
         this.init();
     }
 
@@ -25,11 +27,15 @@ class NutritionChatbot {
         this.analyzeBtn = document.getElementById('analyze-btn');
         this.undoBtn = document.getElementById('undo-btn');
         this.clearBtn = document.getElementById('clear-btn');
+        this.saveUserInfoBtn = document.getElementById('save-user-info-btn');
         this.switchUserBtn = document.getElementById('switch-user-btn');
         this.currentUserDisplay = document.getElementById('current-user-name');
         this.calendarBtn = document.getElementById('calendar-btn');
         this.calendarModal = document.getElementById('calendar-modal');
         this.closeCalendarModalBtn = document.getElementById('close-calendar-modal');
+        this.clearConfirmModal = document.getElementById('clear-confirm-modal');
+        this.clearConfirmBtn = document.getElementById('clear-confirm-btn');
+        this.clearCancelBtn = document.getElementById('clear-cancel-btn');
         this.userModal = document.getElementById('user-modal');
         this.closeUserModalBtn = document.getElementById('close-user-modal');
         this.createUserBtn = document.getElementById('create-user-btn');
@@ -37,17 +43,25 @@ class NutritionChatbot {
         this.userList = document.getElementById('user-list');
         this.defaultMessagesHtml = this.messagesContainer ? this.messagesContainer.innerHTML : '';
 
-        // Counters
+        // Counters (may not exist if stat boxes were removed)
         this.carbsDisplay = document.getElementById('carbs-total');
         this.proteinDisplay = document.getElementById('protein-total');
         this.fatDisplay = document.getElementById('fat-total');
+        this.caloriesDisplay = document.getElementById('calories-total');
+        this.intakeProgress = document.getElementById('intake-progress');
 
         // Event listeners
         this.foodInputForm.addEventListener('submit', (e) => this.handleFoodInput(e));
         this.userInfoForm.addEventListener('change', () => this.updateUserInfo());
+        if (this.saveUserInfoBtn) {
+            this.saveUserInfoBtn.addEventListener('click', () => this.handleSaveUserInfo());
+        }
         this.analyzeBtn.addEventListener('click', () => this.handleAnalyze());
         this.undoBtn.addEventListener('click', () => this.undoLast());
         this.clearBtn.addEventListener('click', () => this.clearAll());
+        this.clearConfirmBtn.addEventListener('click', () => this._confirmClear());
+        this.clearCancelBtn.addEventListener('click', () => this._closeClearModal());
+        this.clearConfirmModal.addEventListener('click', (e) => { if (e.target === this.clearConfirmModal) this._closeClearModal(); });
         this.switchUserBtn.addEventListener('click', () => this.openUserModal());
         this.closeUserModalBtn.addEventListener('click', () => this.closeUserModal());
         this.createUserBtn.addEventListener('click', () => this.handleCreateUser());
@@ -136,14 +150,16 @@ class NutritionChatbot {
         const raw = localStorage.getItem(key);
 
         // Defaults for new users without saved state
-        this.dailyNutrition = { carbs: 0, protein: 0, fat: 0 };
+        this.dailyNutrition = { carbs: 0, protein: 0, fat: 0, calories: 0 };
         this.userInfo = {};
         this.conversationHistory = [];
 
         if (raw) {
             try {
                 const state = JSON.parse(raw);
-                this.dailyNutrition = state.dailyNutrition || { carbs: 0, protein: 0, fat: 0 };
+                this.dailyNutrition = state.dailyNutrition || { carbs: 0, protein: 0, fat: 0, calories: 0 };
+                // Ensure legacy saved states without calories still work
+                if (this.dailyNutrition.calories == null) this.dailyNutrition.calories = 0;
                 this.userInfo = state.userInfo || {};
                 this.conversationHistory = state.conversationHistory || [];
                 if (this.messagesContainer && state.messagesHtml) {
@@ -179,10 +195,41 @@ class NutritionChatbot {
         };
         this.saveData();
         this.updateAnalyzeButtonStatus();
-        
-        // Auto-save to backend if user is logged in
-        if (this.currentUserId) {
-            this.saveUserInfoToBackend();
+        if (this._profileIsFilled()) this._updateProgressBars();
+    }
+
+    async handleSaveUserInfo() {
+        // Collect latest form values then persist
+        this.updateUserInfo();
+
+        const btn = this.saveUserInfoBtn;
+        if (btn) {
+            btn.disabled = true;
+            btn.textContent = 'Saving...';
+        }
+
+        try {
+            if (this.currentUserId) {
+                await this.saveUserInfoToBackend();
+            }
+            if (btn) {
+                btn.textContent = '✓ Saved';
+                btn.style.background = 'var(--success, #22c55e)';
+                setTimeout(() => {
+                    btn.textContent = 'Save';
+                    btn.style.background = '';
+                    btn.disabled = false;
+                }, 1800);
+            }
+        } catch (err) {
+            console.error('[UserInfo] Save failed:', err);
+            if (btn) {
+                btn.textContent = 'Save failed';
+                setTimeout(() => {
+                    btn.textContent = 'Save';
+                    btn.disabled = false;
+                }, 2000);
+            }
         }
     }
 
@@ -240,49 +287,78 @@ class NutritionChatbot {
 
     renderUserList() {
         this.userList.innerHTML = '';
-        
+
         if (this.allUsers.length === 0) {
-            this.userList.innerHTML = '<div class="no-users-message">No users yet. Create one to get started.</div>';
+            this.userList.innerHTML = '<div class="no-users-message">No users yet — add one below.</div>';
             return;
         }
 
         this.allUsers.forEach(user => {
+            const name = user.user_info?.name || user.id;
+            const isActive = user.id === this.currentUserId;
+
             const userItem = document.createElement('div');
-            userItem.className = 'user-item';
-            if (user.id === this.currentUserId) {
-                userItem.classList.add('active');
+            userItem.className = 'user-card' + (isActive ? ' user-card-active' : '');
+
+            // Avatar circle with initials
+            const avatar = document.createElement('div');
+            avatar.className = 'user-avatar';
+            avatar.textContent = name.charAt(0).toUpperCase();
+
+            // Name + status
+            const info = document.createElement('div');
+            info.className = 'user-card-info';
+
+            const nameSpan = document.createElement('span');
+            nameSpan.className = 'user-card-name';
+            nameSpan.textContent = name;
+            nameSpan.dataset.userId = user.id;
+
+            info.appendChild(nameSpan);
+            if (isActive) {
+                const badge = document.createElement('span');
+                badge.className = 'user-active-badge';
+                badge.textContent = 'Active';
+                info.appendChild(badge);
             }
 
-            const userNameSpan = document.createElement('span');
-            userNameSpan.className = 'user-name';
-            userNameSpan.textContent = user.user_info?.name || user.id;
-            userNameSpan.dataset.userId = user.id;
+            // Action buttons
+            const actions = document.createElement('div');
+            actions.className = 'user-card-actions';
 
-            const switchBtn = document.createElement('button');
-            switchBtn.className = 'switch-user-btn';
-            switchBtn.textContent = this.currentUserId === user.id ? '✓ Current' : 'Switch';
-            switchBtn.addEventListener('click', () => this.switchToUser(user));
+            if (!isActive) {
+                const switchBtn = document.createElement('button');
+                switchBtn.className = 'uca-btn uca-switch';
+                switchBtn.title = 'Switch to this user';
+                switchBtn.innerHTML = '&#x21C4;';
+                switchBtn.addEventListener('click', () => this.switchToUser(user));
+                actions.appendChild(switchBtn);
+            }
 
             const editBtn = document.createElement('button');
-            editBtn.className = 'edit-user-btn';
-            editBtn.textContent = 'Edit';
+            editBtn.className = 'uca-btn uca-edit';
+            editBtn.title = 'Rename';
+            editBtn.innerHTML = '&#x270E;';
             editBtn.addEventListener('click', (e) => {
                 e.stopPropagation();
-                this.startInlineUserNameEdit(user.id, userNameSpan, userItem);
+                this.startInlineUserNameEdit(user.id, nameSpan, userItem);
             });
 
             const deleteBtn = document.createElement('button');
-            deleteBtn.className = 'delete-user-btn';
-            deleteBtn.textContent = '✕';
+            deleteBtn.className = 'uca-btn uca-delete';
+            deleteBtn.title = 'Delete user';
+            deleteBtn.innerHTML = '&#x1F5D1;';
             deleteBtn.addEventListener('click', (e) => {
                 e.stopPropagation();
                 this.deleteUser(user.id);
             });
 
-            userItem.appendChild(userNameSpan);
-            userItem.appendChild(switchBtn);
-            userItem.appendChild(editBtn);
-            userItem.appendChild(deleteBtn);
+            actions.appendChild(editBtn);
+            actions.appendChild(deleteBtn);
+
+            userItem.appendChild(avatar);
+            userItem.appendChild(info);
+            userItem.appendChild(actions);
             this.userList.appendChild(userItem);
         });
     }
@@ -292,15 +368,16 @@ class NutritionChatbot {
         if (!user || !userNameSpan || !userItem) return;
 
         // Prevent duplicate inline editors in same row
-        if (userItem.querySelector('.inline-rename-wrapper')) {
-            return;
-        }
+        if (userItem.querySelector('.inline-rename-wrapper')) return;
 
         const currentName = user.user_info?.name || userId;
-        const switchBtn = userItem.querySelector('.switch-user-btn');
-        if (switchBtn) {
-            switchBtn.style.display = 'none';
-        }
+
+        // infoDiv is the direct child of userItem that contains nameSpan
+        const infoDiv = userNameSpan.closest('.user-card-info') || userNameSpan.parentNode;
+        const actionsDiv = userItem.querySelector('.user-card-actions');
+
+        // Hide actions column; wrapper will span both name + actions columns via CSS grid-column
+        if (actionsDiv) actionsDiv.style.display = 'none';
 
         const wrapper = document.createElement('div');
         wrapper.className = 'inline-rename-wrapper';
@@ -324,21 +401,16 @@ class NutritionChatbot {
         wrapper.appendChild(saveBtn);
         wrapper.appendChild(cancelBtn);
 
-        userItem.replaceChild(wrapper, userNameSpan);
+        // Replace the info div (direct child of userItem) with the wrapper
+        userItem.replaceChild(wrapper, infoDiv);
         input.focus();
         input.select();
 
         const cancelEdit = () => {
-            const restoredName = document.createElement('span');
-            restoredName.className = 'user-name';
-            restoredName.dataset.userId = userId;
-            restoredName.textContent = user.user_info?.name || userId;
             if (wrapper.parentNode === userItem) {
-                userItem.replaceChild(restoredName, wrapper);
+                userItem.replaceChild(infoDiv, wrapper);
             }
-            if (switchBtn) {
-                switchBtn.style.display = '';
-            }
+            if (actionsDiv) actionsDiv.style.display = '';
         };
 
         saveBtn.addEventListener('click', async (e) => {
@@ -508,7 +580,7 @@ class NutritionChatbot {
                     this.currentUserId = null;
                     this.currentUserName = 'Guest';
                     this.userRecordId = null;
-                    this.dailyNutrition = { carbs: 0, protein: 0, fat: 0 };
+                    this.dailyNutrition = { carbs: 0, protein: 0, fat: 0, calories: 0 };
                     this.updateDisplay();
                     this.saveData();
                     this.updateCurrentUserDisplay();
@@ -570,14 +642,15 @@ class NutritionChatbot {
         this.addMessage(foodInput, 'user');
         this.foodInput.value = '';
 
-        // Check for direct macro input (e.g., "50g carbs", "+30g protein", "-20g fat")
+        // Check for direct nutrition input (e.g., "50g carbs", "-20g fat", "1000kcal", "-100 kcal")
         const directMacroMatch = foodInput.match(/^([+-]?\d+(?:\.\d+)?)\s*g?\s*(carb|carbon|carbohydrate|protein|fat)s?$/i);
-        if (directMacroMatch) {
-            const amount = parseFloat(directMacroMatch[1]);
-            const macroType = directMacroMatch[2].toLowerCase();
+        const directCalorieMatch = foodInput.match(/^([+-]?\d+(?:\.\d+)?)\s*(kcal|cal|calorie|calories)$/i);
+        if (directMacroMatch || directCalorieMatch) {
+            const amount = parseFloat((directMacroMatch || directCalorieMatch)[1]);
+            const macroType = directMacroMatch ? directMacroMatch[2].toLowerCase() : 'calories';
             
             let macroName = '';
-            let nutrition = { carbs: 0, protein: 0, fat: 0 };
+            let nutrition = { carbs: 0, protein: 0, fat: 0, calories: 0 };
             
             if (macroType === 'carb' || macroType === 'carbon' || macroType === 'carbohydrate') {
                 nutrition.carbs = amount;
@@ -588,15 +661,19 @@ class NutritionChatbot {
             } else if (macroType === 'fat') {
                 nutrition.fat = amount;
                 macroName = 'Fat';
+            } else {
+                nutrition.calories = amount;
+                macroName = 'Calories';
             }
             
             this.addFoodToDaily(nutrition);
             
             const actionText = amount >= 0 ? 'added' : 'removed';
+            const amountUnit = macroName === 'Calories' ? 'kcal' : 'g';
             const responseMsg = `✅ <strong>${macroName}</strong>
             
 <div class="food-item-display">
-    <div class="food-name">${Math.abs(amount)}g ${actionText} directly</div>
+    <div class="food-name">${Math.abs(amount)}${amountUnit} ${actionText} directly</div>
     <div class="nutrition-row">
         <span>Carbs:</span>
         <span>${nutrition.carbs}g</span>
@@ -609,6 +686,10 @@ class NutritionChatbot {
         <span>Fat:</span>
         <span>${nutrition.fat}g</span>
     </div>
+    <div class="nutrition-row">
+        <span>Calories:</span>
+        <span>${nutrition.calories} kcal</span>
+    </div>
 </div>
 
 Your daily totals have been updated. Keep tracking!`;
@@ -618,7 +699,7 @@ Your daily totals have been updated. Keep tracking!`;
             // Add to conversation history
             this.conversationHistory.push({
                 input: foodInput,
-                nutrition: { ...nutrition, food_name: macroName, quantity: amount, unit: 'g' },
+                nutrition: { ...nutrition, food_name: macroName, quantity: amount, unit: macroName === 'Calories' ? 'kcal' : 'g' },
                 timestamp: new Date()
             });
             
@@ -627,8 +708,16 @@ Your daily totals have been updated. Keep tracking!`;
             return;
         }
 
-        // Show loading state
-        const loadingMsg = this.addMessage('🔍 Searching CSV nutrition database...', 'bot', true);
+        // Show loading state — update text if fallback sources are used
+        const loadingMsg = this.addMessage('🔍 Searching CSV database...', 'bot', true);
+
+        // If the request takes longer, CSV missed and we're hitting USDA or Doubao
+        const usdaTimer = setTimeout(() => {
+            this.updateMessage(loadingMsg, '🔍 Not in CSV, checking USDA API...');
+        }, 900);
+        const doubaoTimer = setTimeout(() => {
+            this.updateMessage(loadingMsg, '🤖 Not in USDA, querying Doubao AI...');
+        }, 3500);
 
         try {
             // Call the API
@@ -641,6 +730,8 @@ Your daily totals have been updated. Keep tracking!`;
             });
 
             const result = await response.json();
+            clearTimeout(usdaTimer);
+            clearTimeout(doubaoTimer);
 
             if (!response.ok) {
                 // More helpful error messages
@@ -682,30 +773,52 @@ Your daily totals have been updated. Keep tracking!`;
             this.saveData();
 
         } catch (error) {
+            clearTimeout(usdaTimer);
+            clearTimeout(doubaoTimer);
             console.error('Error:', error);
             this.updateMessage(loadingMsg, '❌ Error processing food. Please try again.');
         }
     }
 
+    _sourceLabel(source) {
+        if (!source || source === 'CSV') return 'CSV database';
+        if (source.includes('USDA')) return 'USDA API';
+        if (source.includes('Doubao')) return 'Doubao AI';
+        return source;
+    }
+
     generateFoodResponse(nutrition, individualFoods = []) {
         let foodsDisplay = '';
-        
+
         // Show individual foods if multiple
         if (individualFoods.length > 1) {
             foodsDisplay = '<div class="foods-list">';
             individualFoods.forEach(food => {
+                const src = this._sourceLabel(food.source);
                 foodsDisplay += `
                 <div class="food-item-display" style="margin-bottom: 12px;">
                     <div class="food-name">${food.quantity}${food.unit} ${food.food_name}</div>
-                    <div class="nutrition-row" style="font-size: 12px; color: #666;">
-                        <span>Carbs: ${food.carbs}g</span> | 
-                        <span>Protein: ${food.protein}g</span> | 
-                        <span>Fat: ${food.fat}g</span>
+                    <div class="nutrition-row">
+                        <span>Calories:</span>
+                        <span>${food.calories ?? 0} kcal</span>
                     </div>
+                    <div class="nutrition-row">
+                        <span>Carbs:</span>
+                        <span>${food.carbs}g</span>
+                    </div>
+                    <div class="nutrition-row">
+                        <span>Protein:</span>
+                        <span>${food.protein}g</span>
+                    </div>
+                    <div class="nutrition-row">
+                        <span>Fat:</span>
+                        <span>${food.fat}g</span>
+                    </div>
+                    <div class="food-source">Source: ${src}</div>
                 </div>`;
             });
             foodsDisplay += '</div>';
-            
+
             return `
 ✅ <strong>Added ${individualFoods.length} foods</strong>
 
@@ -713,6 +826,10 @@ ${foodsDisplay}
 
 <div style="margin-top: 12px; padding-top: 12px; border-top: 1px solid #eee;">
     <strong>Total Added:</strong>
+    <div class="nutrition-row">
+        <span>Calories:</span>
+        <span>${nutrition.calories ?? 0} kcal</span>
+    </div>
     <div class="nutrition-row">
         <span>Carbs:</span>
         <span>${nutrition.carbs}g</span>
@@ -731,11 +848,16 @@ Your daily totals have been updated. Keep tracking!
             `;
         } else if (individualFoods.length === 1) {
             const food = individualFoods[0];
+            const src = this._sourceLabel(food.source || nutrition.source);
             return `
 ✅ <strong>${food.food_name}</strong>
 
 <div class="food-item-display">
     <div class="food-name">${food.quantity}${food.unit} added</div>
+    <div class="nutrition-row">
+        <span>Calories:</span>
+        <span>${food.calories ?? 0} kcal</span>
+    </div>
     <div class="nutrition-row">
         <span>Carbs:</span>
         <span>${food.carbs}g</span>
@@ -748,6 +870,7 @@ Your daily totals have been updated. Keep tracking!
         <span>Fat:</span>
         <span>${food.fat}g</span>
     </div>
+    <div class="food-source">Source: ${src}</div>
 </div>
 
 Your daily totals have been updated. Keep tracking!
@@ -758,6 +881,10 @@ Your daily totals have been updated. Keep tracking!
 ✅ <strong>Food Added</strong>
 
 <div class="food-item-display">
+    <div class="nutrition-row">
+        <span>Calories:</span>
+        <span>${nutrition.calories ?? 0} kcal</span>
+    </div>
     <div class="nutrition-row">
         <span>Carbs:</span>
         <span>${nutrition.carbs}g</span>
@@ -778,23 +905,135 @@ Your daily totals have been updated. Keep tracking!
     }
 
     addFoodToDaily(nutrition) {
-        this.dailyNutrition.carbs += nutrition.carbs;
-        this.dailyNutrition.protein += nutrition.protein;
-        this.dailyNutrition.fat += nutrition.fat;
+        this.dailyNutrition.carbs += nutrition.carbs || 0;
+        this.dailyNutrition.protein += nutrition.protein || 0;
+        this.dailyNutrition.fat += nutrition.fat || 0;
+        this.dailyNutrition.calories += nutrition.calories || 0;
 
         // Round to 2 decimal places
         this.dailyNutrition.carbs = Math.round(this.dailyNutrition.carbs * 100) / 100;
         this.dailyNutrition.protein = Math.round(this.dailyNutrition.protein * 100) / 100;
         this.dailyNutrition.fat = Math.round(this.dailyNutrition.fat * 100) / 100;
+        this.dailyNutrition.calories = Math.round(this.dailyNutrition.calories * 10) / 10;
 
         this.updateDisplay();
         this.saveData();
     }
 
     updateDisplay() {
-        this.carbsDisplay.textContent = this.dailyNutrition.carbs.toFixed(1);
-        this.proteinDisplay.textContent = this.dailyNutrition.protein.toFixed(1);
-        this.fatDisplay.textContent = this.dailyNutrition.fat.toFixed(1);
+        if (this.caloriesDisplay) this.caloriesDisplay.textContent = Math.round(this.dailyNutrition.calories || 0);
+        if (this.carbsDisplay) this.carbsDisplay.textContent = this.dailyNutrition.carbs.toFixed(1);
+        if (this.proteinDisplay) this.proteinDisplay.textContent = this.dailyNutrition.protein.toFixed(1);
+        if (this.fatDisplay) this.fatDisplay.textContent = this.dailyNutrition.fat.toFixed(1);
+        this._updateProgressBars();
+    }
+
+    _profileIsFilled() {
+        const u = this.userInfo;
+        return u && u.gender != null && u.gender !== '' &&
+            parseFloat(u.age) > 0 && parseFloat(u.height) > 0 && parseFloat(u.weight) > 0 &&
+            u.activity !== '' && u.activity != null &&
+            u.diet !== '' && u.diet != null;
+    }
+
+    _calcTargets() {
+        // Recompute targets from profile (mirrors backend calculate_rmr / calculate_daily_calories)
+        const u = this.userInfo;
+        const weight = parseFloat(u.weight) || 70;
+        const height = parseFloat(u.height) || 170;
+        const age    = parseFloat(u.age)    || 25;
+        const gender = parseInt(u.gender)   || 0;
+        const activity = parseInt(u.activity) || 2;
+        const diet   = parseInt(u.diet)     || 0;
+
+        let rmr = gender === 0
+            ? 9.99 * weight + 6.25 * height - 4.92 * age + 5
+            : 9.99 * weight + 6.25 * height - 4.92 * age - 161;
+        const actFactors = [1.2, 1.375, 1.55, 1.725];
+        const calories = rmr * (actFactors[activity] || 1.55);
+
+        // diet plan macros (fraction of calories)
+        const dietScales = [
+            [0.50, 0.20, 0.30], // balanced
+            [0.60, 0.20, 0.20], // low fat
+            [0.20, 0.30, 0.50], // low carb
+            [0.28, 0.39, 0.33], // high protein
+        ];
+        const [cf, pf, ff] = dietScales[diet] || dietScales[0];
+        return {
+            calories: Math.round(calories),
+            carbs:   Math.round(calories * cf / 4.1),
+            protein: Math.round(calories * pf / 4.1),
+            fat:     Math.round(calories * ff / 8.8),
+        };
+    }
+
+    _updateProgressBars() {
+        if (!this.intakeProgress) return;
+
+        // Check for targets from last recommendation first, fall back to computed
+        let targets = null;
+        const lastRec = sessionStorage.getItem('lastRecommendation');
+        if (lastRec) {
+            try {
+                const rec = JSON.parse(lastRec);
+                if (rec && rec.calories) {
+                    targets = {
+                        calories: Math.round(rec.calories),
+                        carbs:    Math.round(rec.carbohydrate_intake),
+                        protein:  Math.round(rec.protein_intake),
+                        fat:      Math.round(rec.fat_intake),
+                    };
+                }
+            } catch (_) {}
+        }
+        if (!targets && this._profileIsFilled()) {
+            targets = this._calcTargets();
+        }
+
+        const bars = [
+            { id: 'calories', intake: Math.round(this.dailyNutrition.calories || 0), unit: 'kcal', target: targets?.calories },
+            { id: 'carbs',    intake: parseFloat(this.dailyNutrition.carbs.toFixed(1)),   unit: 'g', target: targets?.carbs },
+            { id: 'protein',  intake: parseFloat(this.dailyNutrition.protein.toFixed(1)), unit: 'g', target: targets?.protein },
+            { id: 'fat',      intake: parseFloat(this.dailyNutrition.fat.toFixed(1)),     unit: 'g', target: targets?.fat },
+        ];
+
+        bars.forEach(({ id, intake, unit, target }) => {
+            const barEl  = document.getElementById(`${id}-bar`);
+            const textEl = document.getElementById(`${id}-progress-text`);
+            if (!barEl || !textEl) return;
+
+            if (target) {
+                // Profile filled: split-bar — base portion + excess portion
+                const rawPct  = Math.round(intake / target * 100);
+                const excessEl = document.getElementById(`${id}-bar-excess`);
+                textEl.textContent = `${intake} / ${target} ${unit}`;
+                barEl.classList.remove('bar-low', 'bar-mid', 'bar-over', 'bar-danger', 'has-excess');
+
+                if (rawPct <= 100) {
+                    barEl.style.width = rawPct + '%';
+                    if (excessEl) { excessEl.style.width = '0%'; excessEl.classList.remove('pulsing'); }
+                    if (rawPct <= 80) barEl.classList.add('bar-low');
+                    else              barEl.classList.add('bar-mid');
+                } else {
+                    // Split: base occupies its proportional share, excess takes the rest
+                    const baseW   = (100 / rawPct * 100).toFixed(2) + '%';
+                    const excessW = ((rawPct - 100) / rawPct * 100).toFixed(2) + '%';
+                    barEl.style.width = baseW;
+                    barEl.classList.add('has-excess');
+                    if (rawPct <= 120) barEl.classList.add('bar-over');
+                    else               barEl.classList.add('bar-danger');
+                    if (excessEl) { excessEl.style.width = excessW; excessEl.classList.add('pulsing'); }
+                }
+            } else {
+                // No profile: just show raw intake, empty bar
+                const excessEl = document.getElementById(`${id}-bar-excess`);
+                barEl.style.width = '0%';
+                textEl.textContent = `${intake} ${unit}`;
+                barEl.classList.remove('bar-low', 'bar-mid', 'bar-over', 'bar-danger', 'has-excess');
+                if (excessEl) { excessEl.style.width = '0%'; excessEl.classList.remove('pulsing'); }
+            }
+        });
     }
 
     addMessage(text, sender = 'bot', isLoading = false) {
@@ -895,11 +1134,13 @@ Your daily totals have been updated. Keep tracking!
                 this.userRecordId = result.user_id;
                 this.saveData();
             }
+            this._lastRecommendation = rec;
             const responseMsg = this.generateRecommendationResponse(rec);
             this.updateMessage(loadingMsg, responseMsg);
 
             // Store recommendation for further use
             sessionStorage.setItem('lastRecommendation', JSON.stringify(rec));
+            this._updateProgressBars();
 
         } catch (error) {
             console.error('Error:', error);
@@ -910,7 +1151,7 @@ Your daily totals have been updated. Keep tracking!
     updateAnalyzeButtonStatus() {
         // Enable/disable button based on current state
         const hasUserInfo = this.userInfo.gender && this.userInfo.age && this.userInfo.height && this.userInfo.weight;
-        const hasFoodLogged = this.dailyNutrition.carbs > 0 || this.dailyNutrition.protein > 0 || this.dailyNutrition.fat > 0;
+        const hasFoodLogged = this.dailyNutrition.carbs > 0 || this.dailyNutrition.protein > 0 || this.dailyNutrition.fat > 0 || (this.dailyNutrition.calories || 0) > 0;
         
         if (hasUserInfo && hasFoodLogged) {
             this.analyzeBtn.style.opacity = '1';
@@ -931,21 +1172,30 @@ Your daily totals have been updated. Keep tracking!
     generateRecommendationResponse(rec) {
         // Generate multiple recommendation solutions
         let allSolutionsHTML = '';
+        const plannerId = `recipe-planner-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+        this._recipePlanners[plannerId] = { createdAt: Date.now() };
+        const plannerHTML = `
+<div style="margin: 18px 0 0 0; padding-top: 16px; border-top: 2px solid var(--border);">
+    <div style="font-weight: 600; color: var(--text); font-size: 14px; margin-bottom: 10px;">🎯 Build Recipes From Foods You Want</div>
+    <div style="font-size: 12px; color: var(--muted); margin-bottom: 10px;">Enter foods like <strong>chicken breast, broccoli, noodles</strong>. Recipe 1 will use all of them. Recipe 2-4 can use subsets to better meet your supplement needs.</div>
+    <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+        <input id="${plannerId}-input" type="text" placeholder="e.g., chicken breast, broccoli, noodles" style="flex:1; min-width:240px; padding:10px 12px; border:1px solid var(--border); border-radius:8px; font-size:13px;" onkeydown="if(event.key==='Enter'){event.preventDefault(); window._chatbot.generateCustomRecipes('${plannerId}');}">
+        <button type="button" class="btn-primary" style="text-decoration:none;" onclick="window._chatbot.generateCustomRecipes('${plannerId}')">Calculate Recipes</button>
+    </div>
+    <div id="${plannerId}-results" style="margin-top: 12px;"></div>
+</div>`;
         
         if (rec.results.length > 0) {
             rec.results.forEach((result, index) => {
-                const [foods, carbSup, proteinSup, fatSup] = result;
+                const [foods, carbSup, proteinSup, fatSup, folderName] = result;
                 
                 let foodList = '';
                 if (foods.length > 0) {
                     foodList = foods.map(f => {
-                        const meshLink = f.mesh 
-                            ? `<br><a href="/download-stl/${f.mesh}" download class="btn-download" style="margin-left: 0px; margin-top: 4px; display: inline-block;">📥 Download STL</a>`
-                            : '';
                         const dimensions = f.x && f.y && f.z 
                             ? `<span style="font-size: 11px; color: var(--muted); margin-left: 8px;">(${f.x}mm × ${f.y}mm × ${f.z}mm)</span>`
                             : '';
-                        return `<li>${f.name}: ${f.gram}g ${dimensions}${meshLink}</li>`;
+                        return `<li>${f.name}: ${f.gram}g ${dimensions}</li>`;
                     }).join('');
                 } else {
                     foodList = '<li>No specific recommendations at this time</li>';
@@ -967,6 +1217,7 @@ Your daily totals have been updated. Keep tracking!
         </ul>
     </div>
     ${supplementInfo}
+    ${foods && foods.some(f => f.mesh) ? `<a href="#" class="btn-primary" style="display:inline-block; margin-top: 12px; text-decoration: none;" onclick="window._chatbot.downloadStlFolder(${index}); return false;">📁 Download STL Folder</a>${folderName ? `<div style="font-size:11px; color: var(--muted); margin-top:6px;">Folder: ${folderName}</div>` : ''}` : ''}
 </div>`;
             });
         } else {
@@ -1016,6 +1267,8 @@ Your daily totals have been updated. Keep tracking!
     </div>
 </div>
 
+${plannerHTML}
+
 <div style="margin: 18px 0 0 0; padding-top: 16px; border-top: 2px solid var(--border);">
     <div style="font-weight: 600; color: var(--text); font-size: 14px; margin-bottom: 12px;">🍽️ Suggested Food Combinations</div>
     ${allSolutionsHTML}
@@ -1025,6 +1278,138 @@ Your daily totals have been updated. Keep tracking!
     <strong style="color: #22c55e;">✓ Keep tracking</strong> your meals to reach your daily targets! 🎯
 </div>
         `;
+    }
+
+    _escapeHtml(text) {
+        return String(text ?? '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
+    renderCustomRecipeResults(data) {
+        const recipes = Array.isArray(data.recipes) ? data.recipes : [];
+        const unresolved = Array.isArray(data.unresolved_foods) ? data.unresolved_foods : [];
+        const advice = data.advice || {};
+
+        const unresolvedHtml = unresolved.length
+            ? `<div style="margin-bottom: 10px; padding: 10px; background: #fff7ed; border-left: 3px solid var(--accent); border-radius: 6px; font-size: 12px; color: var(--text-secondary);"><strong>Could not resolve:</strong> ${unresolved.map(item => this._escapeHtml(item)).join(', ')}</div>`
+            : '';
+
+        const adviceFoods = Array.isArray(advice.suggested_foods) ? advice.suggested_foods : [];
+        const adviceHtml = (advice.message || adviceFoods.length)
+            ? `<div style="margin-bottom: 10px; padding: 10px; background: #eefbf3; border-left: 3px solid #22c55e; border-radius: 6px; font-size: 12px; color: var(--text-secondary);"><strong>Advice:</strong> ${this._escapeHtml(advice.message || 'Consider adding these foods.')}${adviceFoods.length ? ` Suggested foods: <strong>${adviceFoods.map(item => this._escapeHtml(item)).join(', ')}</strong>.` : ''}</div>`
+            : '';
+
+        const recipesHtml = recipes.length ? recipes.map((recipe, idx) => {
+            const foods = (recipe.foods || []).map(food => `<li>${this._escapeHtml(food.name)}: ${food.gram}g</li>`).join('');
+            const supplied = recipe.supplied || {};
+            const usingAll = recipe.uses_all_requested ? '<div style="font-size:12px; color: var(--accent); margin-bottom: 8px;"><strong>Uses all requested foods</strong></div>' : '';
+            return `
+<div style="margin: 12px 0; padding: 12px; background: #ffffff; border: 1px solid var(--border); border-radius: 10px;">
+    <div style="font-weight: 700; margin-bottom: 8px; color: var(--text); font-size: 14px;">${this._escapeHtml(recipe.title || `Recipe ${idx + 1}`)}</div>
+    ${usingAll}
+    <ul style="margin: 0 0 8px 0; padding-left: 20px; font-size: 13px; color: var(--text-secondary);">${foods}</ul>
+    <div style="font-size: 12px; color: var(--muted); line-height: 1.5;">
+        Supplies: Carbs <strong>${supplied.carbs ?? 0}g</strong>, Protein <strong>${supplied.protein ?? 0}g</strong>, Fat <strong>${supplied.fat ?? 0}g</strong><br>
+        Exceed: <strong>${recipe.exceed_total ?? 0}g</strong> | Remaining gap: <strong>${recipe.shortfall_total ?? 0}g</strong>
+    </div>
+</div>`;
+        }).join('') : '<div style="padding: 12px; background: #ffffff; border: 1px solid var(--border); border-radius: 8px; color: var(--muted); font-size: 13px;">No recipes could be calculated from those foods.</div>';
+
+        return `${unresolvedHtml}${adviceHtml}${recipesHtml}`;
+    }
+
+    async generateCustomRecipes(plannerId) {
+        const inputEl = document.getElementById(`${plannerId}-input`);
+        const resultsEl = document.getElementById(`${plannerId}-results`);
+        if (!inputEl || !resultsEl) return;
+
+        const foodText = (inputEl.value || '').trim();
+        if (!foodText) {
+            resultsEl.innerHTML = '<div style="padding: 10px; background: #fff7ed; border: 1px solid #fed7aa; border-radius: 8px; font-size: 12px; color: var(--text-secondary);">Please enter foods like chicken breast, broccoli, noodles.</div>';
+            return;
+        }
+
+        resultsEl.innerHTML = '<div style="padding: 10px; font-size: 12px; color: var(--muted);">Calculating recipe amounts...</div>';
+
+        try {
+            const response = await fetch('/api/calculate-custom-recipes', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    user_info: this.userInfo,
+                    daily_nutrition: this.dailyNutrition,
+                    food_text: foodText
+                })
+            });
+
+            const data = await response.json();
+            if (!response.ok) {
+                resultsEl.innerHTML = `<div style="padding: 10px; background: #fff7ed; border: 1px solid #fed7aa; border-radius: 8px; font-size: 12px; color: var(--text-secondary);">${this._escapeHtml(data.error || 'Could not calculate recipes.')}</div>`;
+                return;
+            }
+
+            resultsEl.innerHTML = this.renderCustomRecipeResults(data);
+        } catch (error) {
+            console.error('Custom recipe generation failed:', error);
+            resultsEl.innerHTML = '<div style="padding: 10px; background: #fff7ed; border: 1px solid #fed7aa; border-radius: 8px; font-size: 12px; color: var(--text-secondary);">Could not calculate recipes right now.</div>';
+        }
+    }
+
+    async downloadStlFolder(optionIndex) {
+        try {
+            if (!window.showDirectoryPicker) {
+                this.addMessage('⚠️ Your browser does not support direct folder save. Please use a Chromium browser (Chrome/Edge).', 'bot');
+                return;
+            }
+
+            const rec = this._lastRecommendation || JSON.parse(sessionStorage.getItem('lastRecommendation') || 'null');
+            const result = rec?.results?.[optionIndex];
+            if (!result) {
+                this.addMessage('⚠️ No recommendation data found for this option.', 'bot');
+                return;
+            }
+
+            const [foods, , , , folderHint] = result;
+            const meshFiles = (foods || []).map(f => f.mesh).filter(Boolean);
+            if (meshFiles.length === 0) {
+                this.addMessage('⚠️ No STL files available for this option.', 'bot');
+                return;
+            }
+
+            const now = new Date();
+            const y = now.getFullYear();
+            const m = String(now.getMonth() + 1).padStart(2, '0');
+            const d = String(now.getDate()).padStart(2, '0');
+            const folderName = folderHint || `${y}${m}${d}_option${optionIndex + 1}`;
+
+            const parentHandle = await window.showDirectoryPicker();
+            const folderHandle = await parentHandle.getDirectoryHandle(folderName, { create: true });
+
+            for (const meshName of meshFiles) {
+                const url = `/download-stl/${encodeURIComponent(meshName)}`;
+                const response = await fetch(url);
+                if (!response.ok) {
+                    throw new Error(`Failed to download ${meshName}: ${response.status}`);
+                }
+                const blob = await response.blob();
+                const fileHandle = await folderHandle.getFileHandle(meshName, { create: true });
+                const writable = await fileHandle.createWritable();
+                await writable.write(blob);
+                await writable.close();
+            }
+
+            this.addMessage(`✅ Saved ${meshFiles.length} STL files to folder <strong>${folderName}</strong>.`, 'bot');
+        } catch (error) {
+            const isAbort = String(error?.name || '').toLowerCase() === 'aborterror';
+            if (!isAbort) {
+                console.error('Folder save failed:', error);
+                this.addMessage(`❌ Failed to save STL folder: ${error?.message || 'Unknown error'}`, 'bot');
+            }
+        }
     }
 
     undoLast() {
@@ -1038,19 +1423,22 @@ Your daily totals have been updated. Keep tracking!
         const lastNutrition = lastEntry.nutrition;
 
         // Subtract from daily totals
-        this.dailyNutrition.carbs -= lastNutrition.carbs;
-        this.dailyNutrition.protein -= lastNutrition.protein;
-        this.dailyNutrition.fat -= lastNutrition.fat;
+        this.dailyNutrition.carbs -= lastNutrition.carbs || 0;
+        this.dailyNutrition.protein -= lastNutrition.protein || 0;
+        this.dailyNutrition.fat -= lastNutrition.fat || 0;
+        this.dailyNutrition.calories = (this.dailyNutrition.calories || 0) - (lastNutrition.calories || 0);
 
         // Ensure no negative values
         this.dailyNutrition.carbs = Math.max(0, this.dailyNutrition.carbs);
         this.dailyNutrition.protein = Math.max(0, this.dailyNutrition.protein);
         this.dailyNutrition.fat = Math.max(0, this.dailyNutrition.fat);
+        this.dailyNutrition.calories = Math.max(0, this.dailyNutrition.calories);
 
         // Round to 2 decimal places
         this.dailyNutrition.carbs = Math.round(this.dailyNutrition.carbs * 100) / 100;
         this.dailyNutrition.protein = Math.round(this.dailyNutrition.protein * 100) / 100;
         this.dailyNutrition.fat = Math.round(this.dailyNutrition.fat * 100) / 100;
+        this.dailyNutrition.calories = Math.round(this.dailyNutrition.calories * 10) / 10;
 
         this.updateDisplay();
         this.saveData();
@@ -1060,25 +1448,66 @@ Your daily totals have been updated. Keep tracking!
     }
 
     clearAll() {
-        if (this.dailyNutrition.carbs === 0 && this.dailyNutrition.protein === 0 && this.dailyNutrition.fat === 0) {
+        if (this.dailyNutrition.carbs === 0 && this.dailyNutrition.protein === 0 && this.dailyNutrition.fat === 0 && (this.dailyNutrition.calories || 0) === 0) {
             this.addMessage('⚠️ Nothing to clear. No food entries found.', 'bot');
             return;
         }
+        // Show custom confirm modal
+        this.clearConfirmModal.style.display = 'flex';
+    }
 
-        // Confirm before clearing
-        const confirmed = confirm('Are you sure you want to clear all food entries? This cannot be undone.');
-        if (!confirmed) return;
+    _closeClearModal() {
+        this.clearConfirmModal.style.display = 'none';
+    }
 
-        this.dailyNutrition = { carbs: 0, protein: 0, fat: 0 };
+    _confirmClear() {
+        this._closeClearModal();
+        // Snapshot for undo
+        this._clearSnapshot = {
+            dailyNutrition: { ...this.dailyNutrition },
+            conversationHistory: [...this.conversationHistory]
+        };
+        this.dailyNutrition = { carbs: 0, protein: 0, fat: 0, calories: 0 };
         this.conversationHistory = [];
         this.updateDisplay();
         this.saveData();
         this.updateAnalyzeButtonStatus();
-        this.addMessage('✨ All food entries have been cleared. Your daily tracker has been reset!', 'bot');
+
+        // Add message with inline undo button
+        const msgId = 'undo-clear-msg-' + Date.now();
+        this.addMessage(
+            `✨ All food entries cleared. <button id="${msgId}" ` +
+            `style="margin-left:8px;padding:3px 10px;font-size:12px;cursor:pointer;` +
+            `background:#ff7a3d;color:#fff;border:none;border-radius:6px;" ` +
+            `onclick="window._chatbot.undoClear('${msgId}')">↩ Undo</button>`,
+            'bot'
+        );
+
+        // Auto-expire undo after 10 seconds
+        this._clearUndoTimer = setTimeout(() => {
+            this._clearSnapshot = null;
+            const btn = document.getElementById(msgId);
+            if (btn) btn.remove();
+        }, 10000);
+    }
+
+    undoClear(msgId) {
+        if (!this._clearSnapshot) return;
+        clearTimeout(this._clearUndoTimer);
+        this.dailyNutrition = this._clearSnapshot.dailyNutrition;
+        this.conversationHistory = this._clearSnapshot.conversationHistory;
+        this._clearSnapshot = null;
+        this.updateDisplay();
+        this.saveData();
+        this.updateAnalyzeButtonStatus();
+        // Remove the undo message entirely
+        const btn = document.getElementById(msgId);
+        if (btn) btn.closest('.message') && btn.closest('.message').remove();
+        this.addMessage('↩ Cleared entries have been restored!', 'bot');
     }
 
     resetDaily() {
-        this.dailyNutrition = { carbs: 0, protein: 0, fat: 0 };
+        this.dailyNutrition = { carbs: 0, protein: 0, fat: 0, calories: 0 };
         this.conversationHistory = [];
         this.updateDisplay();
         this.saveData();
@@ -1225,9 +1654,19 @@ Your daily totals have been updated. Keep tracking!
         const fmt = (v) => Number(v || 0).toFixed(1);
         const pctBar = (actual, target) => {
             if (!target) return '';
-            const pct = Math.min(100, Math.round((actual / target) * 100));
-            const color = pct >= 90 ? '#22c55e' : pct >= 60 ? '#f59e0b' : '#ef4444';
-            return `<div class="cal-bar-wrap"><div class="cal-bar-fill" style="width:${pct}%;background:${color};"></div></div>`;
+            const raw = Math.round((actual / target) * 100);
+            if (raw <= 100) {
+                const cls = raw <= 80 ? 'bar-low' : 'bar-mid';
+                return `<div class="cal-bar-wrap"><div class="cal-bar-fill ${cls}" style="width:${raw}%;"></div></div>`;
+            }
+            // Split: base + excess
+            const baseW   = (100 / raw * 100).toFixed(2);
+            const excessW = ((raw - 100) / raw * 100).toFixed(2);
+            const baseCls = raw <= 120 ? 'bar-over' : 'bar-danger';
+            return `<div class="cal-bar-wrap">` +
+                `<div class="cal-bar-fill ${baseCls} has-excess" style="width:${baseW}%;"></div>` +
+                `<div class="cal-bar-excess" style="width:${excessW}%;"></div>` +
+                `</div>`;
         };
 
         const row = (icon, lbl, actual, target, unit) => `
@@ -1274,4 +1713,5 @@ Your daily totals have been updated. Keep tracking!
 // Initialize chatbot when DOM is ready
 document.addEventListener('DOMContentLoaded', () => {
     window.chatbot = new NutritionChatbot();
+    window._chatbot = window.chatbot;
 });

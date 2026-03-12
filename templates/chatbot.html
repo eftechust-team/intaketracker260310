@@ -7,7 +7,7 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Sora:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/static/base.css">
-    <link rel="stylesheet" href="/static/chatbot.css">
+    <link rel="stylesheet" href="/static/chatbot.css?v=10">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>ELEVATEFOODS - Food Chatbot</title>
 </head>
@@ -28,6 +28,23 @@
             </div>
         </div>
     </header>
+
+    <!-- Clear Confirm Modal -->
+    <div id="clear-confirm-modal" class="modal" style="display: none;">
+        <div class="modal-content" style="max-width: 380px; text-align: center;">
+            <div class="modal-header" style="justify-content: center; border-bottom: none; padding-bottom: 0;">
+                <span style="font-size: 2rem;">🗑️</span>
+            </div>
+            <div class="modal-body" style="padding-top: 8px;">
+                <h3 style="margin: 0 0 8px; font-size: 1.1rem;">Clear all food entries?</h3>
+                <p style="margin: 0 0 20px; color: #888; font-size: 0.9rem;">This will reset today's tracker. You can undo immediately after.</p>
+                <div style="display: flex; gap: 10px; justify-content: center;">
+                    <button id="clear-cancel-btn" class="btn-secondary" style="flex: 1; max-width: 140px;">Cancel</button>
+                    <button id="clear-confirm-btn" class="btn-primary" style="flex: 1; max-width: 140px; background: #e74c3c; border-color: #e74c3c;">Clear</button>
+                </div>
+            </div>
+        </div>
+    </div>
 
     <!-- Calendar Modal -->
     <div id="calendar-modal" class="modal" style="display: none;">
@@ -56,25 +73,21 @@
 
     <!-- User Account Modal -->
     <div id="user-modal" class="modal" style="display: none;">
-        <div class="modal-content">
+        <div class="modal-content user-modal-content">
             <div class="modal-header">
-                <h2>User Accounts</h2>
+                <div class="modal-title-group">
+                    <span class="modal-icon">👥</span>
+                    <h2>User Accounts</h2>
+                </div>
                 <button type="button" class="modal-close" id="close-user-modal">&times;</button>
             </div>
             <div class="modal-body">
-                <div class="modal-section">
-                    <h3>Existing Users</h3>
-                    <div id="user-list" class="user-list">
-                        <!-- Populated by JS -->
-                    </div>
+                <div id="user-list" class="user-list">
+                    <!-- Populated by JS -->
                 </div>
-                <div class="modal-section">
-                    <h3>Create New User</h3>
-                    <div class="form-field">
-                        <label>User Name</label>
-                        <input type="text" id="new-user-name" placeholder="e.g., Mom, Dad, Child">
-                    </div>
-                    <button type="button" id="create-user-btn" class="btn-primary">Create User</button>
+                <div class="user-create-row">
+                    <input type="text" id="new-user-name" placeholder="New user name…" autocomplete="off">
+                    <button type="button" id="create-user-btn" class="btn-create-user">+ Add</button>
                 </div>
             </div>
         </div>
@@ -86,71 +99,103 @@
             <aside class="nutrition-sidebar">
                 <div class="sidebar-panel">
                     <h3>Today's Intake</h3>
-                    <div class="nutrition-summary">
-                        <div class="nutrition-item">
-                            <span class="label">Carbs</span>
-                            <span class="value" id="carbs-total">0</span>
-                            <span class="unit">g</span>
+                    <!-- Progress bars: show intake / target when profile filled, intake-only otherwise -->
+                    <div id="intake-progress">
+                        <div class="intake-bar-group">
+                            <div class="intake-bar-label">
+                                <span>Calories</span>
+                                <span id="calories-progress-text">0 kcal</span>
+                            </div>
+                            <div class="intake-bar-track">
+                                <div class="intake-bar-fill calories-bar" id="calories-bar" style="width:0%"></div>
+                                <div class="intake-bar-excess" id="calories-bar-excess" style="width:0%"></div>
+                            </div>
                         </div>
-                        <div class="nutrition-item">
-                            <span class="label">Protein</span>
-                            <span class="value" id="protein-total">0</span>
-                            <span class="unit">g</span>
+                        <div class="intake-bar-group">
+                            <div class="intake-bar-label">
+                                <span>Carbs</span>
+                                <span id="carbs-progress-text">0 g</span>
+                            </div>
+                            <div class="intake-bar-track">
+                                <div class="intake-bar-fill carbs-bar" id="carbs-bar" style="width:0%"></div>
+                                <div class="intake-bar-excess" id="carbs-bar-excess" style="width:0%"></div>
+                            </div>
                         </div>
-                        <div class="nutrition-item">
-                            <span class="label">Fat</span>
-                            <span class="value" id="fat-total">0</span>
-                            <span class="unit">g</span>
+                        <div class="intake-bar-group">
+                            <div class="intake-bar-label">
+                                <span>Protein</span>
+                                <span id="protein-progress-text">0 g</span>
+                            </div>
+                            <div class="intake-bar-track">
+                                <div class="intake-bar-fill protein-bar" id="protein-bar" style="width:0%"></div>
+                                <div class="intake-bar-excess" id="protein-bar-excess" style="width:0%"></div>
+                            </div>
+                        </div>
+                        <div class="intake-bar-group">
+                            <div class="intake-bar-label">
+                                <span>Fat</span>
+                                <span id="fat-progress-text">0 g</span>
+                            </div>
+                            <div class="intake-bar-track">
+                                <div class="intake-bar-fill fat-bar" id="fat-bar" style="width:0%"></div>
+                                <div class="intake-bar-excess" id="fat-bar-excess" style="width:0%"></div>
+                            </div>
                         </div>
                     </div>
-                    <div style="display: flex; gap: 8px; margin-top: 12px;">
+                    <div style="display: flex; gap: 8px; margin-top: 8px;">
                         <button id="undo-btn" class="btn-secondary" style="flex: 1; padding: 8px; font-size: 12px;" title="Undo last food entry">↶ Undo</button>
                         <button id="clear-btn" class="btn-secondary" style="flex: 1; padding: 8px; font-size: 12px;" title="Clear all food entries">✕ Clear All</button>
                     </div>
-                    <button id="analyze-btn" class="btn-primary" style="width: 100%; margin-top: 12px;">Get Recommendations</button>
+                    <button id="analyze-btn" class="btn-primary" style="width: 100%; margin-top: 8px;">Get Recommendations</button>
                 </div>
 
                 <div class="sidebar-panel">
                     <h3>Your Info</h3>
                     <form id="user-info-form" class="user-info-form">
-                        <div class="form-field">
-                            <label>Gender</label>
-                            <div class="radio-group-compact">
-                                <label><input type="radio" name="gender" value="0"> M</label>
-                                <label><input type="radio" name="gender" value="1"> F</label>
+                        <div class="form-row">
+                            <div class="form-field">
+                                <label>Gender</label>
+                                <div class="radio-group-compact">
+                                    <label><input type="radio" name="gender" value="0"> M</label>
+                                    <label><input type="radio" name="gender" value="1"> F</label>
+                                </div>
+                            </div>
+                            <div class="form-field">
+                                <label>Age</label>
+                                <input type="number" name="age" placeholder="Years">
                             </div>
                         </div>
-                        <div class="form-field">
-                            <label>Age</label>
-                            <input type="number" name="age" placeholder="Years">
+                        <div class="form-row">
+                            <div class="form-field">
+                                <label>Height</label>
+                                <input type="number" name="height" placeholder="cm">
+                            </div>
+                            <div class="form-field">
+                                <label>Weight</label>
+                                <input type="number" name="weight" placeholder="kg">
+                            </div>
                         </div>
-                        <div class="form-field">
-                            <label>Height</label>
-                            <input type="number" name="height" placeholder="cm">
-                        </div>
-                        <div class="form-field">
-                            <label>Weight</label>
-                            <input type="number" name="weight" placeholder="kg">
-                        </div>
-                        <div class="form-field">
-                            <label>ACTIVITY LEVEL</label>
-                            <select name="activity">
-                                <option value="">Select...</option>
-                                <option value="0">Sedentary</option>
-                                <option value="1">Low Active</option>
-                                <option value="2">Active</option>
-                                <option value="3">Very Active</option>
-                            </select>
-                        </div>
-                        <div class="form-field">
-                            <label>Diet Plan</label>
-                            <select name="diet">
-                                <option value="">Select...</option>
-                                <option value="0">Balanced</option>
-                                <option value="1">Low Fat</option>
-                                <option value="2">Low Carb</option>
-                                <option value="3">High Protein</option>
-                            </select>
+                        <div class="form-row">
+                            <div class="form-field">
+                                <label>Activity</label>
+                                <select name="activity">
+                                    <option value="">Select...</option>
+                                    <option value="0">Sedentary</option>
+                                    <option value="1">Low Active</option>
+                                    <option value="2">Active</option>
+                                    <option value="3">Very Active</option>
+                                </select>
+                            </div>
+                            <div class="form-field">
+                                <label>Diet</label>
+                                <select name="diet">
+                                    <option value="">Select...</option>
+                                    <option value="0">Balanced</option>
+                                    <option value="1">Low Fat</option>
+                                    <option value="2">Low Carb</option>
+                                    <option value="3">High Protein</option>
+                                </select>
+                            </div>
                         </div>
                         <div class="form-field">
                             <label>Preference</label>
@@ -159,6 +204,7 @@
                                 <label><input type="radio" name="preference" value="1"> Plant-based</label>
                             </div>
                         </div>
+                        <button type="button" id="save-user-info-btn" class="btn-primary" style="width: 100%; margin-top: 4px;">Save</button>
                     </form>
                 </div>
 
