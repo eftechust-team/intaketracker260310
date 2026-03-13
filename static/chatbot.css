@@ -287,6 +287,11 @@
     border-radius: 16px 16px 16px 4px;
 }
 
+.message.trashed-entry-message .message-content {
+    border-style: dashed;
+    color: var(--muted);
+}
+
 .message-content p {
     margin: 0 0 8px 0;
     font-size: 14px;
@@ -334,6 +339,183 @@
     margin-top: 6px;
     font-size: 11px;
     color: var(--muted);
+}
+
+.food-entry-actions {
+    margin-top: 10px;
+    display: flex;
+    gap: 8px;
+}
+
+.food-entry-actions.is-editing {
+    display: block;
+    background: rgba(255, 255, 255, 0.75);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px;
+}
+
+.food-item-display.food-item-editing {
+    border-color: rgba(59, 130, 246, 0.35);
+    background: #ffffff;
+    padding-top: 8px;
+    padding-bottom: 8px;
+}
+
+.food-item-display.food-item-editing .food-name {
+    margin-bottom: 4px;
+    font-size: 12px;
+}
+
+.food-item-display.food-item-editing .nutrition-row {
+    margin: 1px 0;
+    font-size: 11px;
+    line-height: 1.1;
+}
+
+input.food-item-edit-input[type="number"] {
+    width: 112px;
+    height: 30px !important;
+    min-height: 30px !important;
+    padding: 0 6px !important;
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    font-size: 12px !important;
+    font-family: inherit;
+    margin-right: 4px;
+    color: var(--text);
+    background: #fff;
+    line-height: 30px;
+    vertical-align: middle;
+    box-sizing: border-box;
+    -webkit-appearance: none;
+    appearance: textfield;
+}
+
+input.food-item-edit-input[type="number"]::-webkit-outer-spin-button,
+input.food-item-edit-input[type="number"]::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+}
+
+.food-item-display.food-item-editing .nutrition-row span:last-child {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.food-item-edit-input:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px rgba(255, 122, 61, 0.14);
+}
+
+.entry-action-btn {
+    border: none;
+    border-radius: 7px;
+    padding: 4px 10px;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s ease;
+}
+
+.entry-edit-btn {
+    background: rgba(59, 130, 246, 0.12);
+    color: #1d4ed8;
+}
+
+.entry-edit-btn:hover {
+    background: rgba(59, 130, 246, 0.2);
+}
+
+.entry-original-btn {
+    background: rgba(34, 197, 94, 0.12);
+    color: #166534;
+}
+
+.entry-original-btn:hover {
+    background: rgba(34, 197, 94, 0.2);
+}
+
+.entry-original-btn.is-disabled,
+.entry-original-btn:disabled {
+    background: rgba(156, 163, 175, 0.2);
+    color: #6b7280;
+    cursor: not-allowed;
+}
+
+.entry-original-btn.is-disabled:hover,
+.entry-original-btn:disabled:hover {
+    background: rgba(156, 163, 175, 0.2);
+}
+
+.entry-trash-btn {
+    background: rgba(239, 68, 68, 0.12);
+    color: #b91c1c;
+}
+
+.entry-trash-btn:hover {
+    background: rgba(239, 68, 68, 0.2);
+}
+
+.entry-editor-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+}
+
+.entry-editor-grid label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 11px;
+    color: var(--muted);
+    font-weight: 600;
+}
+
+.entry-edit-input {
+    width: 100%;
+    min-height: 30px;
+    height: 30px;
+    padding: 4px 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 12px;
+    font-family: inherit;
+    color: var(--text);
+    background: #fff;
+    box-sizing: border-box;
+}
+
+.entry-edit-input:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(255, 122, 61, 0.12);
+}
+
+.entry-editor-actions {
+    margin-top: 10px;
+    display: flex;
+    gap: 8px;
+}
+
+.entry-save-btn {
+    background: rgba(34, 197, 94, 0.16);
+    color: #166534;
+}
+
+.entry-save-btn:hover {
+    background: rgba(34, 197, 94, 0.26);
+}
+
+.entry-cancel-btn {
+    background: rgba(107, 114, 128, 0.16);
+    color: #374151;
+}
+
+.entry-cancel-btn:hover {
+    background: rgba(107, 114, 128, 0.24);
 }
 
 /* Sidebar-scoped button sizing */

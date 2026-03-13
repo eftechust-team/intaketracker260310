@@ -14,6 +14,8 @@ class NutritionChatbot {
         this.userInfo = {};
         this.userRecordId = null;
         this.conversationHistory = [];
+        this._entryCounter = 0;
+        this._undoActions = [];
         this._recipePlanners = {};
         this.init();
     }
@@ -153,6 +155,7 @@ class NutritionChatbot {
         this.dailyNutrition = { carbs: 0, protein: 0, fat: 0, calories: 0 };
         this.userInfo = {};
         this.conversationHistory = [];
+        this._undoActions = [];
 
         if (raw) {
             try {
@@ -162,6 +165,7 @@ class NutritionChatbot {
                 if (this.dailyNutrition.calories == null) this.dailyNutrition.calories = 0;
                 this.userInfo = state.userInfo || {};
                 this.conversationHistory = state.conversationHistory || [];
+                this._ensureConversationEntryIds();
                 if (this.messagesContainer && state.messagesHtml) {
                     this.messagesContainer.innerHTML = state.messagesHtml;
                     this.messagesContainer.scrollTop = this.messagesContainer.scrollHeight;
@@ -178,6 +182,409 @@ class NutritionChatbot {
         this.updateDisplay();
         this.populateUserForm();
         this.updateAnalyzeButtonStatus();
+    }
+
+    _nextEntryId() {
+        this._entryCounter += 1;
+        return `entry-${Date.now()}-${this._entryCounter}`;
+    }
+
+    _ensureConversationEntryIds() {
+        this.conversationHistory = (this.conversationHistory || []).map((entry) => {
+            if (!entry || typeof entry !== 'object') return entry;
+            if (!entry.id) entry.id = this._nextEntryId();
+            if (!entry.originalNutrition && entry.nutrition) {
+                entry.originalNutrition = this._roundNutrition({ ...entry.nutrition });
+            }
+            return entry;
+        });
+    }
+
+    _normalizeNutrition(nutrition = {}) {
+        return {
+            carbs: Number(nutrition.carbs || 0),
+            protein: Number(nutrition.protein || 0),
+            fat: Number(nutrition.fat || 0),
+            calories: Number(nutrition.calories || 0),
+            food_name: nutrition.food_name,
+            quantity: nutrition.quantity,
+            unit: nutrition.unit,
+            source: nutrition.source
+        };
+    }
+
+    _roundNutrition(nutrition = {}) {
+        return {
+            ...nutrition,
+            carbs: Math.round((Number(nutrition.carbs || 0)) * 100) / 100,
+            protein: Math.round((Number(nutrition.protein || 0)) * 100) / 100,
+            fat: Math.round((Number(nutrition.fat || 0)) * 100) / 100,
+            calories: Math.round((Number(nutrition.calories || 0)) * 10) / 10
+        };
+    }
+
+    _applyNutritionDelta(deltaNutrition = {}, clampToZero = false) {
+        this.dailyNutrition.carbs += Number(deltaNutrition.carbs || 0);
+        this.dailyNutrition.protein += Number(deltaNutrition.protein || 0);
+        this.dailyNutrition.fat += Number(deltaNutrition.fat || 0);
+        this.dailyNutrition.calories += Number(deltaNutrition.calories || 0);
+
+        if (clampToZero) {
+            this.dailyNutrition.carbs = Math.max(0, this.dailyNutrition.carbs);
+            this.dailyNutrition.protein = Math.max(0, this.dailyNutrition.protein);
+            this.dailyNutrition.fat = Math.max(0, this.dailyNutrition.fat);
+            this.dailyNutrition.calories = Math.max(0, this.dailyNutrition.calories);
+        }
+
+        this.dailyNutrition = this._roundNutrition(this.dailyNutrition);
+        this.updateDisplay();
+        this.saveData();
+        this.updateAnalyzeButtonStatus();
+    }
+
+    _isEntryUsingOriginal(entry) {
+        if (!entry || !entry.nutrition) return true;
+        const current = this._normalizeNutrition(entry.nutrition || {});
+        const original = this._normalizeNutrition(entry.originalNutrition || entry.nutrition || {});
+        return (
+            current.carbs === original.carbs &&
+            current.protein === original.protein &&
+            current.fat === original.fat &&
+            current.calories === original.calories
+        );
+    }
+
+    _buildEntryActionsHtml(entry) {
+        if (!entry || !entry.id) return '';
+        return `
+<div class="food-entry-actions" data-entry-id="${entry.id}">
+    ${this._buildEntryActionsInnerHtml(entry.id, entry)}
+</div>`;
+    }
+
+    _buildEntryActionsInnerHtml(entryId, entry = null) {
+        const resolvedEntry = entry || this._getEntryById(entryId).entry;
+        const isOriginal = this._isEntryUsingOriginal(resolvedEntry);
+        const originalDisabledClass = isOriginal ? ' is-disabled' : '';
+        const originalDisabledAttr = isOriginal ? ' disabled' : '';
+        return `
+    <button type="button" class="entry-action-btn entry-edit-btn" onclick="window._chatbot.editFoodEntry('${entryId}')">Edit</button>
+    <button type="button" class="entry-action-btn entry-original-btn${originalDisabledClass}" onclick="window._chatbot.restoreOriginalFoodEntry('${entryId}')"${originalDisabledAttr}>Original</button>
+    <button type="button" class="entry-action-btn entry-trash-btn" onclick="window._chatbot.deleteFoodEntry('${entryId}')">Trash</button>`;
+    }
+
+    _renderFoodEntryInlineEditMessage(entry) {
+        if (!entry) return '';
+        const nutrition = this._normalizeNutrition(entry.nutrition || {});
+        const title = this._escapeHtml(entry.label || entry.input || entry.nutrition?.food_name || 'Food entry');
+        return `
+✏️ <strong>Edit Nutrition</strong>
+
+<div class="food-item-display food-item-editing" data-entry-id="${entry.id}">
+    <div class="food-name">${title}</div>
+    <div class="nutrition-row">
+        <span>Calories:</span>
+        <span><input type="number" class="food-item-edit-input" data-field="calories" step="0.1" value="${nutrition.calories}"> kcal</span>
+    </div>
+    <div class="nutrition-row">
+        <span>Carbs:</span>
+        <span><input type="number" class="food-item-edit-input" data-field="carbs" step="0.1" value="${nutrition.carbs}"> g</span>
+    </div>
+    <div class="nutrition-row">
+        <span>Protein:</span>
+        <span><input type="number" class="food-item-edit-input" data-field="protein" step="0.1" value="${nutrition.protein}"> g</span>
+    </div>
+    <div class="nutrition-row">
+        <span>Fat:</span>
+        <span><input type="number" class="food-item-edit-input" data-field="fat" step="0.1" value="${nutrition.fat}"> g</span>
+    </div>
+</div>
+
+<div class="food-entry-actions" data-entry-id="${entry.id}">
+    <button type="button" class="entry-action-btn entry-save-btn" onclick="window._chatbot.saveFoodEntryEdit('${entry.id}')">Save</button>
+    <button type="button" class="entry-action-btn entry-cancel-btn" onclick="window._chatbot.cancelFoodEntryEdit('${entry.id}')">Cancel</button>
+</div>`;
+    }
+
+    _renderFoodEntryMessage(entry) {
+        if (!entry) return '';
+        const nutrition = this._normalizeNutrition(entry.nutrition || {});
+        let content = '';
+
+        if (entry.type === 'direct') {
+            const macroName = entry.macroName || 'Nutrition';
+            const amount = Number(entry.quantity || 0);
+            const actionText = amount >= 0 ? 'added' : 'removed';
+            const amountUnit = macroName === 'Calories' ? 'kcal' : 'g';
+            content = `✅ <strong>${macroName}</strong>
+
+<div class="food-item-display">
+    <div class="food-name">${Math.abs(amount)}${amountUnit} ${actionText} directly</div>
+    <div class="nutrition-row">
+        <span>Carbs:</span>
+        <span>${nutrition.carbs}g</span>
+    </div>
+    <div class="nutrition-row">
+        <span>Protein:</span>
+        <span>${nutrition.protein}g</span>
+    </div>
+    <div class="nutrition-row">
+        <span>Fat:</span>
+        <span>${nutrition.fat}g</span>
+    </div>
+    <div class="nutrition-row">
+        <span>Calories:</span>
+        <span>${nutrition.calories} kcal</span>
+    </div>
+</div>
+
+Your daily totals have been updated. Keep tracking!`;
+        } else if (entry.type === 'manual-edit') {
+            content = `✅ <strong>Food Entry Updated</strong>
+
+<div class="food-item-display">
+    <div class="food-name">${this._escapeHtml(entry.label || entry.input || 'Edited entry')}</div>
+    <div class="nutrition-row">
+        <span>Calories:</span>
+        <span>${nutrition.calories} kcal</span>
+    </div>
+    <div class="nutrition-row">
+        <span>Carbs:</span>
+        <span>${nutrition.carbs}g</span>
+    </div>
+    <div class="nutrition-row">
+        <span>Protein:</span>
+        <span>${nutrition.protein}g</span>
+    </div>
+    <div class="nutrition-row">
+        <span>Fat:</span>
+        <span>${nutrition.fat}g</span>
+    </div>
+    <div class="food-source">Source: manual edit</div>
+</div>
+
+Your daily totals have been updated. Keep tracking!`;
+        } else {
+            content = this.generateFoodResponse(nutrition, entry.individualFoods || []);
+        }
+
+        return `${content}${this._buildEntryActionsHtml(entry)}`;
+    }
+
+    _getEntryById(entryId) {
+        const index = this.conversationHistory.findIndex((entry) => entry && entry.id === entryId);
+        if (index < 0) return { index: -1, entry: null };
+        return { index, entry: this.conversationHistory[index] };
+    }
+
+    _updateEntryMessageContent(entry) {
+        if (!entry || !entry.id) return;
+        const actionWrap = this.messagesContainer.querySelector(`.food-entry-actions[data-entry-id="${entry.id}"]`);
+        if (!actionWrap) return;
+        const message = actionWrap.closest('.message');
+        const content = message ? message.querySelector('.message-content') : null;
+        if (!content) return;
+        content.innerHTML = this._renderFoodEntryMessage(entry);
+        if (this.currentUserId) this.saveCurrentUserState();
+    }
+
+    _findMessageByEntryId(entryId) {
+        const actionWrap = this.messagesContainer.querySelector(`.food-entry-actions[data-entry-id="${entryId}"]`);
+        return actionWrap ? actionWrap.closest('.message') : null;
+    }
+
+    deleteFoodEntry(entryId) {
+        const { index, entry } = this._getEntryById(entryId);
+        if (!entry || index < 0) {
+            this.addMessage('⚠️ Could not find that food entry.', 'bot');
+            return;
+        }
+
+        const nutrition = this._normalizeNutrition(entry.nutrition || {});
+        this._applyNutritionDelta({
+            carbs: -nutrition.carbs,
+            protein: -nutrition.protein,
+            fat: -nutrition.fat,
+            calories: -nutrition.calories
+        }, true);
+
+        this.conversationHistory.splice(index, 1);
+
+        this._undoActions.push({
+            type: 'trash',
+            entry: JSON.parse(JSON.stringify(entry)),
+            index,
+            timestamp: Date.now()
+        });
+
+        const message = this._findMessageByEntryId(entryId);
+        if (message) {
+            const content = message.querySelector('.message-content');
+            if (content) {
+                content.innerHTML = '🗑️ <strong>Food entry trashed.</strong> Press Undo to restore this entry and intake totals.';
+                content.setAttribute('data-trashed-entry-id', entryId);
+                message.classList.add('trashed-entry-message');
+            } else {
+                message.remove();
+            }
+        }
+
+        this.saveData();
+        if (!message) {
+            this.addMessage('🗑️ Food entry removed. Press Undo to restore it with intake totals.', 'bot');
+        }
+    }
+
+    editFoodEntry(entryId) {
+        const { entry } = this._getEntryById(entryId);
+        if (!entry) {
+            this.addMessage('⚠️ Could not find that food entry.', 'bot');
+            return;
+        }
+
+        const message = this._findMessageByEntryId(entryId);
+        const content = message ? message.querySelector('.message-content') : null;
+        if (!content) {
+            this.addMessage('⚠️ Could not open inline editor for this entry.', 'bot');
+            return;
+        }
+
+        content.innerHTML = this._renderFoodEntryInlineEditMessage(entry);
+
+        const firstInput = content.querySelector('.food-item-edit-input');
+        if (firstInput) firstInput.focus();
+    }
+
+    cancelFoodEntryEdit(entryId) {
+        const { entry } = this._getEntryById(entryId);
+        if (!entry) return;
+        this._updateEntryMessageContent(entry);
+    }
+
+    saveFoodEntryEdit(entryId) {
+        const { entry } = this._getEntryById(entryId);
+        if (!entry) {
+            this.addMessage('⚠️ Could not find that food entry.', 'bot');
+            return;
+        }
+
+        const message = this._findMessageByEntryId(entryId);
+        const content = message ? message.querySelector('.message-content') : null;
+        if (!content) {
+            this.addMessage('⚠️ Could not find inline editor for this entry.', 'bot');
+            return;
+        }
+
+        const current = this._normalizeNutrition(entry.nutrition || {});
+        const previousNutrition = this._roundNutrition({ ...current });
+        const previousType = entry.type;
+        const previousUpdatedAt = entry.updated_at;
+
+        const readValue = (field) => {
+            const el = content.querySelector(`.food-item-edit-input[data-field="${field}"]`);
+            if (!el) return NaN;
+            return Number(el.value);
+        };
+
+        const nextCarbs = readValue('carbs');
+        const nextProtein = readValue('protein');
+        const nextFat = readValue('fat');
+        const nextCalories = readValue('calories');
+
+        if ([nextCarbs, nextProtein, nextFat, nextCalories].some((v) => Number.isNaN(v))) {
+            this.addMessage('⚠️ Invalid number entered. Please correct the values.', 'bot');
+            return;
+        }
+
+        const updatedNutrition = this._roundNutrition({
+            ...current,
+            carbs: nextCarbs,
+            protein: nextProtein,
+            fat: nextFat,
+            calories: nextCalories
+        });
+
+        const delta = {
+            carbs: updatedNutrition.carbs - current.carbs,
+            protein: updatedNutrition.protein - current.protein,
+            fat: updatedNutrition.fat - current.fat,
+            calories: updatedNutrition.calories - current.calories
+        };
+
+        entry.nutrition = updatedNutrition;
+        entry.type = 'manual-edit';
+        entry.updated_at = new Date().toISOString();
+
+        this._undoActions.push({
+            type: 'edit',
+            entryId,
+            previousNutrition,
+            previousType,
+            previousUpdatedAt,
+            timestamp: Date.now()
+        });
+
+        this._applyNutritionDelta(delta, true);
+        this._updateEntryMessageContent(entry);
+        this.saveData();
+        const editedName = this._escapeHtml(entry.label || entry.input || entry.nutrition?.food_name || 'Food entry');
+        this.addMessage(`✏️ Updated <strong>${editedName}</strong> and recalculated intake totals.`, 'bot');
+    }
+
+    restoreOriginalFoodEntry(entryId) {
+        const { entry } = this._getEntryById(entryId);
+        if (!entry) {
+            this.addMessage('⚠️ Could not find that food entry.', 'bot');
+            return;
+        }
+
+        const originalNutrition = this._normalizeNutrition(entry.originalNutrition || entry.nutrition || {});
+        const current = this._normalizeNutrition(entry.nutrition || {});
+
+        const isSame =
+            originalNutrition.carbs === current.carbs &&
+            originalNutrition.protein === current.protein &&
+            originalNutrition.fat === current.fat &&
+            originalNutrition.calories === current.calories;
+
+        if (isSame) {
+            this.addMessage('ℹ️ This entry is already using the original nutrition values.', 'bot');
+            return;
+        }
+
+        const previousNutrition = this._roundNutrition({ ...current });
+        const previousType = entry.type;
+        const previousUpdatedAt = entry.updated_at;
+
+        const restoredNutrition = this._roundNutrition({
+            ...current,
+            ...originalNutrition
+        });
+
+        const delta = {
+            carbs: restoredNutrition.carbs - current.carbs,
+            protein: restoredNutrition.protein - current.protein,
+            fat: restoredNutrition.fat - current.fat,
+            calories: restoredNutrition.calories - current.calories
+        };
+
+        entry.nutrition = restoredNutrition;
+        entry.type = 'manual-edit';
+        entry.updated_at = new Date().toISOString();
+
+        this._undoActions.push({
+            type: 'edit',
+            entryId,
+            previousNutrition,
+            previousType,
+            previousUpdatedAt,
+            timestamp: Date.now()
+        });
+
+        this._applyNutritionDelta(delta, true);
+        this._updateEntryMessageContent(entry);
+        this.saveData();
+        this.addMessage('♻️ Restored original nutrition data for this food entry.', 'bot');
     }
 
 
@@ -665,43 +1072,33 @@ class NutritionChatbot {
                 nutrition.calories = amount;
                 macroName = 'Calories';
             }
-            
-            this.addFoodToDaily(nutrition);
-            
-            const actionText = amount >= 0 ? 'added' : 'removed';
-            const amountUnit = macroName === 'Calories' ? 'kcal' : 'g';
-            const responseMsg = `✅ <strong>${macroName}</strong>
-            
-<div class="food-item-display">
-    <div class="food-name">${Math.abs(amount)}${amountUnit} ${actionText} directly</div>
-    <div class="nutrition-row">
-        <span>Carbs:</span>
-        <span>${nutrition.carbs}g</span>
-    </div>
-    <div class="nutrition-row">
-        <span>Protein:</span>
-        <span>${nutrition.protein}g</span>
-    </div>
-    <div class="nutrition-row">
-        <span>Fat:</span>
-        <span>${nutrition.fat}g</span>
-    </div>
-    <div class="nutrition-row">
-        <span>Calories:</span>
-        <span>${nutrition.calories} kcal</span>
-    </div>
-</div>
 
-Your daily totals have been updated. Keep tracking!`;
-            
-            this.addMessage(responseMsg, 'bot');
-            
-            // Add to conversation history
-            this.conversationHistory.push({
+            const entry = {
+                id: this._nextEntryId(),
                 input: foodInput,
-                nutrition: { ...nutrition, food_name: macroName, quantity: amount, unit: macroName === 'Calories' ? 'kcal' : 'g' },
-                timestamp: new Date()
-            });
+                label: `${Math.abs(amount)}${macroName === 'Calories' ? 'kcal' : 'g'} ${macroName}`,
+                nutrition: this._roundNutrition({
+                    ...nutrition,
+                    food_name: macroName,
+                    quantity: amount,
+                    unit: macroName === 'Calories' ? 'kcal' : 'g'
+                }),
+                originalNutrition: this._roundNutrition({
+                    ...nutrition,
+                    food_name: macroName,
+                    quantity: amount,
+                    unit: macroName === 'Calories' ? 'kcal' : 'g'
+                }),
+                macroName,
+                quantity: amount,
+                type: 'direct',
+                timestamp: new Date().toISOString()
+            };
+
+            this.conversationHistory.push(entry);
+            this._undoActions.push({ type: 'add', entryId: entry.id, timestamp: Date.now() });
+            this.addFoodToDaily(entry.nutrition);
+            this.addMessage(this._renderFoodEntryMessage(entry), 'bot');
             
             this.updateAnalyzeButtonStatus();
             this.saveData();
@@ -753,19 +1150,23 @@ Your daily totals have been updated. Keep tracking!`;
                 return;
             }
             
-            this.addFoodToDaily(nutrition);
+            const entry = {
+                id: this._nextEntryId(),
+                input: foodInput,
+                label: foodInput,
+                nutrition: this._roundNutrition({ ...nutrition, food_name: nutrition.food_name || foodInput }),
+                originalNutrition: this._roundNutrition({ ...nutrition, food_name: nutrition.food_name || foodInput }),
+                individualFoods,
+                type: 'search',
+                timestamp: new Date().toISOString()
+            };
+
+            this.conversationHistory.push(entry);
+            this._undoActions.push({ type: 'add', entryId: entry.id, timestamp: Date.now() });
+            this.addFoodToDaily(entry.nutrition);
 
             // Generate friendly response showing all foods if multiple
-            const responseMsg = this.generateFoodResponse(nutrition, individualFoods);
-            this.updateMessage(loadingMsg, responseMsg);
-
-            // Add to conversation history
-            this.conversationHistory.push({
-                input: foodInput,
-                nutrition: nutrition,
-                individualFoods: individualFoods,
-                timestamp: new Date()
-            });
+            this.updateMessage(loadingMsg, this._renderFoodEntryMessage(entry));
 
             // Auto-update analyze button status
             this.updateAnalyzeButtonStatus();
@@ -905,19 +1306,7 @@ Your daily totals have been updated. Keep tracking!
     }
 
     addFoodToDaily(nutrition) {
-        this.dailyNutrition.carbs += nutrition.carbs || 0;
-        this.dailyNutrition.protein += nutrition.protein || 0;
-        this.dailyNutrition.fat += nutrition.fat || 0;
-        this.dailyNutrition.calories += nutrition.calories || 0;
-
-        // Round to 2 decimal places
-        this.dailyNutrition.carbs = Math.round(this.dailyNutrition.carbs * 100) / 100;
-        this.dailyNutrition.protein = Math.round(this.dailyNutrition.protein * 100) / 100;
-        this.dailyNutrition.fat = Math.round(this.dailyNutrition.fat * 100) / 100;
-        this.dailyNutrition.calories = Math.round(this.dailyNutrition.calories * 10) / 10;
-
-        this.updateDisplay();
-        this.saveData();
+        this._applyNutritionDelta(nutrition, false);
     }
 
     updateDisplay() {
@@ -1472,38 +1861,96 @@ ${plannerHTML}
     }
 
     undoLast() {
-        if (this.conversationHistory.length === 0) {
+        if (this._undoActions.length === 0 && this.conversationHistory.length === 0) {
             this.addMessage('⚠️ Nothing to undo. No food entries found.', 'bot');
             return;
+        }
+
+        const undoAction = this._undoActions.pop();
+        if (undoAction && undoAction.type === 'edit' && undoAction.entryId) {
+            const { entry } = this._getEntryById(undoAction.entryId);
+            if (entry) {
+                const currentNutrition = this._normalizeNutrition(entry.nutrition || {});
+                const previousNutrition = this._normalizeNutrition(undoAction.previousNutrition || {});
+                const deltaBack = {
+                    carbs: previousNutrition.carbs - currentNutrition.carbs,
+                    protein: previousNutrition.protein - currentNutrition.protein,
+                    fat: previousNutrition.fat - currentNutrition.fat,
+                    calories: previousNutrition.calories - currentNutrition.calories
+                };
+
+                entry.nutrition = this._roundNutrition({ ...previousNutrition });
+                entry.type = undoAction.previousType || entry.type;
+                if (undoAction.previousUpdatedAt) {
+                    entry.updated_at = undoAction.previousUpdatedAt;
+                } else {
+                    delete entry.updated_at;
+                }
+
+                this._applyNutritionDelta(deltaBack, true);
+                this._updateEntryMessageContent(entry);
+                this.saveData();
+                this.addMessage('↶ Undone: last edit was reverted and intake totals restored.', 'bot');
+                return;
+            }
+        }
+
+        if (undoAction && undoAction.type === 'trash') {
+            const restoredEntry = undoAction.entry;
+            const insertAt = Math.max(0, Math.min(undoAction.index, this.conversationHistory.length));
+            this.conversationHistory.splice(insertAt, 0, restoredEntry);
+
+            const restoredNutrition = this._normalizeNutrition(restoredEntry.nutrition || {});
+            this._applyNutritionDelta(restoredNutrition, false);
+
+            const trashedContent = this.messagesContainer.querySelector(`.message-content[data-trashed-entry-id="${restoredEntry.id}"]`);
+            if (trashedContent) {
+                trashedContent.innerHTML = this._renderFoodEntryMessage(restoredEntry);
+                trashedContent.removeAttribute('data-trashed-entry-id');
+                const trashedMessage = trashedContent.closest('.message');
+                if (trashedMessage) trashedMessage.classList.remove('trashed-entry-message');
+            } else {
+                this.addMessage(this._renderFoodEntryMessage(restoredEntry), 'bot');
+            }
+
+            this.saveData();
+            return;
+        }
+
+        if (undoAction && undoAction.type === 'add' && undoAction.entryId) {
+            const idx = this.conversationHistory.findIndex((entry) => entry && entry.id === undoAction.entryId);
+            if (idx >= 0) {
+                const removedEntry = this.conversationHistory.splice(idx, 1)[0];
+                const removedNutrition = this._normalizeNutrition(removedEntry.nutrition || {});
+                this._applyNutritionDelta({
+                    carbs: -removedNutrition.carbs,
+                    protein: -removedNutrition.protein,
+                    fat: -removedNutrition.fat,
+                    calories: -removedNutrition.calories
+                }, true);
+                const msgEl = this._findMessageByEntryId(undoAction.entryId);
+                if (msgEl) msgEl.remove();
+
+                const undoName = removedNutrition.food_name || removedEntry.label || removedEntry.input || 'food entry';
+                this.addMessage(`↶ Undone: <strong>${this._escapeHtml(undoName)}</strong> has been removed from your daily totals.`, 'bot');
+                this.saveData();
+                return;
+            }
         }
 
         // Get the last entry
         const lastEntry = this.conversationHistory.pop();
         const lastNutrition = lastEntry.nutrition;
 
-        // Subtract from daily totals
-        this.dailyNutrition.carbs -= lastNutrition.carbs || 0;
-        this.dailyNutrition.protein -= lastNutrition.protein || 0;
-        this.dailyNutrition.fat -= lastNutrition.fat || 0;
-        this.dailyNutrition.calories = (this.dailyNutrition.calories || 0) - (lastNutrition.calories || 0);
+        this._applyNutritionDelta({
+            carbs: -(lastNutrition.carbs || 0),
+            protein: -(lastNutrition.protein || 0),
+            fat: -(lastNutrition.fat || 0),
+            calories: -(lastNutrition.calories || 0)
+        }, true);
 
-        // Ensure no negative values
-        this.dailyNutrition.carbs = Math.max(0, this.dailyNutrition.carbs);
-        this.dailyNutrition.protein = Math.max(0, this.dailyNutrition.protein);
-        this.dailyNutrition.fat = Math.max(0, this.dailyNutrition.fat);
-        this.dailyNutrition.calories = Math.max(0, this.dailyNutrition.calories);
-
-        // Round to 2 decimal places
-        this.dailyNutrition.carbs = Math.round(this.dailyNutrition.carbs * 100) / 100;
-        this.dailyNutrition.protein = Math.round(this.dailyNutrition.protein * 100) / 100;
-        this.dailyNutrition.fat = Math.round(this.dailyNutrition.fat * 100) / 100;
-        this.dailyNutrition.calories = Math.round(this.dailyNutrition.calories * 10) / 10;
-
-        this.updateDisplay();
-        this.saveData();
-        this.updateAnalyzeButtonStatus();
-
-        this.addMessage(`↶ Undone: <strong>${lastNutrition.food_name}</strong> (${lastNutrition.quantity}${lastNutrition.unit}) has been removed from your daily totals.`, 'bot');
+        const undoName = lastNutrition.food_name || lastEntry.label || lastEntry.input || 'food entry';
+        this.addMessage(`↶ Undone: <strong>${this._escapeHtml(undoName)}</strong> has been removed from your daily totals.`, 'bot');
     }
 
     clearAll() {
